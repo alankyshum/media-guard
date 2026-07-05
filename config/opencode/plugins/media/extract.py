@@ -191,17 +191,171 @@ def extract_whisper(path, model, timeout):
     return None, None, {"why": (err or out or "whisper produced no text")[-400:]}
 
 
+def transcribe_via_skill(audio_path, timeout, model="turbo"):
+    SKILL_DIR = os.path.expanduser("~/.claude/skills/tool--transcribe/scripts")
+    script_path = os.path.join(SKILL_DIR, "transcribe_audio.py")
+    if not os.path.exists(script_path):
+        return None, None, {"why": f"transcribe_audio.py not found at {script_path}"}
+
+    venv_py = os.path.join(SKILL_DIR, ".venv/bin/python")
+    if os.path.exists(venv_py):
+        py = venv_py
+    elif sys.executable:
+        py = sys.executable
+    else:
+        py = "python3"
+
+    tmpdir = tempfile.mkdtemp(prefix="oc-transcribe-")
+    cmd = [py, script_path, audio_path, "--formats", "txt", "--model", model, "--backend", "auto", "--output-dir", tmpdir]
+    try:
+        try:
+            rc, out, err = run(cmd, timeout)
+        except subprocess.TimeoutExpired:
+            raise
+        text = None
+        if rc == 0:
+            for fn in os.listdir(tmpdir):
+                if fn.endswith(".txt"):
+                    with open(os.path.join(tmpdir, fn), "r", errors="replace") as f:
+                        text = f.read()
+                    break
+        if rc == 0 and text is not None and text.strip():
+            return text, "transcribe-skill", {"model": model, "backend": "auto"}
+        why = f"rc={rc}"
+        if err and err.strip():
+            why += f", err={err[-200:].strip()}"
+        elif out and out.strip():
+            why += f", out={out[-200:].strip()}"
+        else:
+            why += ", no txt produced"
+        return None, None, {"why": f"transcribe_via_skill failed: {why}"}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def extract_video(path, model, timeout):
+    if which("crv"):
+        outdir = tempfile.mkdtemp(prefix="oc-crv-")
+        cmd = ["crv", path, "-o", outdir, "--no-transcribe", "--keep-audio", "--max-frames", "24"]
+        try:
+            rc, out, err = run(cmd, timeout)
+        except subprocess.TimeoutExpired:
+            raise
+
+        frames = []
+        audio = None
+        manifest = None
+        for root, dirs, files in os.walk(outdir):
+            for f in files:
+                f_low = f.lower()
+                full_p = os.path.join(root, f)
+                if f_low.endswith((".jpg", ".jpeg", ".png")):
+                    frames.append(full_p)
+                elif f_low == "audio.m4a" or f_low.endswith((".m4a", ".wav", ".aac")):
+                    if audio is None or f_low == "audio.m4a":
+                        audio = full_p
+                elif "manifest" in f_low:
+                    manifest = full_p
+        frames.sort()
+
+        transcript_text = ""
+        if audio:
+            try:
+                skill_model = "turbo" if model == "base" else model
+                text, _, _ = transcribe_via_skill(audio, timeout, skill_model)
+                if text:
+                    transcript_text = text
+            except subprocess.TimeoutExpired:
+                raise
+            except Exception:
+                pass
+
+        return (
+            transcript_text,
+            "crv+transcribe-skill",
+            {
+                "frames": frames,
+                "manifest": manifest,
+                "audio": audio,
+                "frame_count": len(frames)
+            }
+        )
+
+    elif which("ffmpeg"):
+        fd, wav = tempfile.mkstemp(suffix=".wav", prefix="oc-ffmpeg-")
+        os.close(fd)
+        cmd = ["ffmpeg", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", wav]
+        try:
+            try:
+                rc, out, err = run(cmd, timeout)
+            except subprocess.TimeoutExpired:
+                raise
+            if rc == 0:
+                skill_model = "turbo" if model == "base" else model
+                text, _, _ = transcribe_via_skill(wav, timeout, skill_model)
+                if text:
+                    return (text, "ffmpeg+transcribe-skill", {"frames": [], "audio": None, "degraded": "crv-unavailable"})
+                else:
+                    return (None, None, {"why": "ffmpeg audio extracted but transcription failed", "frames": [], "audio": None, "degraded": "crv-unavailable"})
+            else:
+                return (None, None, {"why": f"ffmpeg failed with rc={rc}, err={err[-200:].strip() if err else ''}", "frames": [], "degraded": "crv-unavailable"})
+        except subprocess.TimeoutExpired:
+            raise
+        except Exception as e:
+            return (None, None, {"why": f"ffmpeg degradation error: {str(e)}", "frames": [], "degraded": "crv-unavailable"})
+        finally:
+            try:
+                os.remove(wav)
+            except Exception:
+                pass
+
+    else:
+        return None, None, {"why": "crv & ffmpeg unavailable"}
+
+
 # ---------- image via tesseract ----------
+def _run_tesseract(img_path, timeout):
+    proc = subprocess.run(
+        ["tesseract", img_path, "stdout"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    return proc.returncode, proc.stdout.decode("utf-8", errors="replace"), proc.stderr.decode("utf-8", errors="replace")
+
+
 def extract_image(path, timeout):
     if not which("tesseract"):
         return None, None, {"why": "tesseract not installed"}
+    # 1) direct
     try:
-        rc, out, err = run(["tesseract", path, "stdout"], timeout)
+        rc, out, err = _run_tesseract(path, timeout)
     except subprocess.TimeoutExpired:
         raise
     if rc == 0 and out.strip():
         return out, "tesseract", {}
-    return None, None, {"why": (err or "tesseract produced no text")[-400:]}
+
+    # 2) leptonica on this platform can fail to open certain paths (notably
+    #    files under literal /tmp) or odd filenames. Retry against a copy in a
+    #    clean $TMPDIR workdir with a simple ASCII name — keeps parsing LOCAL.
+    ext = os.path.splitext(path)[1].lower() or ".png"
+    workdir = tempfile.mkdtemp(prefix="oc-ocr-")
+    try:
+        workfile = os.path.join(workdir, "img" + ext)
+        try:
+            shutil.copyfile(path, workfile)
+        except Exception as e:
+            return None, None, {"why": f"tesseract failed and copy for retry failed: {e}"}
+        try:
+            rc2, out2, err2 = _run_tesseract(workfile, timeout)
+        except subprocess.TimeoutExpired:
+            raise
+        if rc2 == 0 and out2.strip():
+            return out2, "tesseract", {"retried_via": "tmpdir-copy"}
+        why = (err2 or err or "tesseract produced no text")[-400:]
+        return None, None, {"why": why}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ---------- plain text ----------
@@ -259,8 +413,31 @@ def main():
     try:
         if kind == "pdf":
             text, tool, meta = extract_pdf(path, args.timeout)
-        elif kind in ("audio", "video"):
-            text, tool, meta = extract_whisper(path, args.model, args.timeout)
+        elif kind == "audio":
+            skill_model = "turbo" if args.model == "base" else args.model
+            try:
+                text, tool, meta = transcribe_via_skill(path, args.timeout, model=skill_model)
+            except subprocess.TimeoutExpired:
+                raise
+            except Exception as e:
+                text, tool, meta = None, None, {"why": f"transcribe_via_skill raised exception: {str(e)}"}
+            if not text:
+                text, tool, whisper_meta = extract_whisper(path, args.model, args.timeout)
+                if meta:
+                    whisper_meta.update(meta)
+                meta = whisper_meta
+        elif kind == "video":
+            try:
+                text, tool, meta = extract_video(path, args.model, args.timeout)
+            except subprocess.TimeoutExpired:
+                raise
+            except Exception as e:
+                text, tool, meta = None, None, {"why": f"extract_video raised exception: {str(e)}"}
+            if not text and (not meta or not meta.get("frames")):
+                text, tool, whisper_meta = extract_whisper(path, args.model, args.timeout)
+                if meta:
+                    whisper_meta.update(meta)
+                meta = whisper_meta
         elif kind == "image":
             text, tool, meta = extract_image(path, args.timeout)
         elif kind == "text":
@@ -276,13 +453,14 @@ def main():
         result["detail"] = str(e)
         print(json.dumps(result)); return
 
-    if not text or not text.strip():
+    has_frames = bool(meta and meta.get("frames"))
+    if (not text or not text.strip()) and not has_frames:
         result["status"] = "unavailable"
         result["meta"] = meta or {}
         result["detail"] = (meta or {}).get("why", "no extractable text / backend unavailable")
         print(json.dumps(result)); return
 
-    text = text.replace("\x00", "").strip()
+    text = (text or "").replace("\x00", "").strip()
     full_len = len(text)
     truncated = False
     if full_len > args.max_chars:
