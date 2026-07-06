@@ -44,9 +44,9 @@ type Options = {
   timeoutSec?: number
   // Media kinds routed to the cheap agent. Default ["image"].
   agentKinds?: string[]
-  // Model identifier for the cheap agent. Default: the `code` tier's opencode model from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
+  // Model identifier for the cheap agent. Default: the code-oc agent's model from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
   agentModel?: string
-  // Model variant for the cheap agent. Default: the `code` tier's opencode variant from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
+  // Model variant for the cheap agent. Default: the code-oc agent's effort from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
   agentVariant?: string
   // Timeout (seconds) for cheap agent calls. Default 300.
   agentTimeoutSec?: number
@@ -158,8 +158,8 @@ function videoPrompt(goal: string, transcript: string): string {
   return p
 }
 
-// The cheap-agent model/variant default to the `code` tier defined in the
-// single source of truth (config/agent-runtime/agent-config.yml), so a tier
+// The cheap-agent model/effort default to the code-oc agent defined in the
+// single source of truth (config/agent-runtime/agent-config.yml), so a model
 // swap there propagates here without editing this plugin. Resolved via the
 // plugin's real path (opencode loads it through a symlink). Falls back to a
 // hardcoded pair if the SOT is unreachable (e.g. plugin used outside dotfiles).
@@ -169,11 +169,11 @@ const REAL_PLUGIN_PATH = (() => {
 })()
 const SOT_YML = join(dirname(REAL_PLUGIN_PATH), "..", "..", "agent-runtime", "agent-config.yml")
 
-function resolveCodeTier(): { model?: string; variant?: string } {
+function resolveCheapAgent(): { model?: string; effort?: string } {
   try {
     const spec: any = parseYaml(readFileSync(SOT_YML, "utf8"))
-    const code = spec?.tiers?.code
-    return { model: code?.models?.opencode, variant: code?.variant }
+    const agent = spec?.agents?.["code-oc"]
+    return { model: agent?.model, effort: agent?.effort }
   } catch {
     return {}
   }
@@ -181,9 +181,9 @@ function resolveCodeTier(): { model?: string; variant?: string } {
 
 export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
   const agentKinds = new Set(opts.agentKinds ?? ["image"])
-  const codeTier = resolveCodeTier()
-  const agentModel = opts.agentModel ?? codeTier.model ?? "github-copilot/gemini-3.5-flash"
-  const agentVariant = opts.agentVariant ?? codeTier.variant ?? "medium"
+  const cheapAgent = resolveCheapAgent()
+  const agentModel = opts.agentModel ?? cheapAgent.model ?? "github-copilot/gemini-3.5-flash"
+  const agentVariant = opts.agentVariant ?? cheapAgent.effort ?? "medium"
   const agentTimeoutMs = (opts.agentTimeoutSec ?? 300) * 1000
 
   const mimes = [...(opts.mimes ?? DEFAULT_MIMES)]
