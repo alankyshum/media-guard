@@ -44,9 +44,9 @@ type Options = {
   timeoutSec?: number
   // Media kinds routed to the cheap agent. Default ["image"].
   agentKinds?: string[]
-  // Model identifier for the cheap agent. Default: the code-oc agent's model from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
+  // Model identifier for the cheap agent. Default: the ui-ux-designer agent's model from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
   agentModel?: string
-  // Model variant for the cheap agent. Default: the code-oc agent's effort from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
+  // Model variant for the cheap agent. Default: the ui-ux-designer agent's effort from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
   agentVariant?: string
   // Timeout (seconds) for cheap agent calls. Default 300.
   agentTimeoutSec?: number
@@ -158,11 +158,12 @@ function videoPrompt(goal: string, transcript: string): string {
   return p
 }
 
-// The cheap-agent model/effort default to the code-oc agent defined in the
-// single source of truth (config/agent-runtime/agent-config.yml), so a model
-// swap there propagates here without editing this plugin. Resolved via the
+// The cheap-agent model/effort can be overridden via plugin opts (agentModel/
+// agentVariant). Otherwise, they default to the ui-ux-designer agent defined in the
+// single source of truth (config/agent-runtime/agent-config.yml) because it is vision-capable,
+// so a model/effort swap there propagates here without editing this plugin. Resolved via the
 // plugin's real path (opencode loads it through a symlink). Falls back to a
-// hardcoded pair if the SOT is unreachable (e.g. plugin used outside dotfiles).
+// hardcoded gemini pair if the SOT is unreachable (e.g. plugin used outside dotfiles).
 const REAL_PLUGIN_PATH = (() => {
   const p = fileURLToPath(import.meta.url)
   try { return realpathSync(p) } catch { return p }
@@ -172,7 +173,7 @@ const SOT_YML = join(dirname(REAL_PLUGIN_PATH), "..", "..", "agent-runtime", "ag
 function resolveCheapAgent(): { model?: string; effort?: string } {
   try {
     const spec: any = parseYaml(readFileSync(SOT_YML, "utf8"))
-    const agent = spec?.agents?.["code-oc"]
+    const agent = spec?.agents?.["ui-ux-designer"]
     return { model: agent?.model, effort: agent?.effort }
   } catch {
     return {}
