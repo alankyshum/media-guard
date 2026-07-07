@@ -168,11 +168,11 @@ const REAL_PLUGIN_PATH = (() => {
   const p = fileURLToPath(import.meta.url)
   try { return realpathSync(p) } catch { return p }
 })()
-const SOT_YML = join(dirname(REAL_PLUGIN_PATH), "..", "..", "agent-runtime", "agent-config.yml")
+const SOT_YAML = join(dirname(REAL_PLUGIN_PATH), "..", "..", "agent-runtime", "agent-config.yml")
 
 function resolveCheapAgent(): { model?: string; effort?: string } {
   try {
-    const spec: any = parseYaml(readFileSync(SOT_YML, "utf8"))
+    const spec: any = parseYaml(readFileSync(SOT_YAML, "utf8"))
     const agent = spec?.agents?.["ui-ux-designer"]
     return { model: agent?.model, effort: agent?.effort }
   } catch {
