@@ -44,7 +44,7 @@ def main():
     count = int(sys.argv[2])
     os.makedirs(outdir, exist_ok=True)
 
-    for i in range(count):
+    for i in range(1, count + 1):
         img = Image.new("RGB", (W, H), "white")
         draw = ImageDraw.Draw(img)
         text = f"MEDIAGUARD OCR TOKEN {i:04d}"
@@ -60,7 +60,7 @@ def main():
     print(f"Generated {count} images in {outdir}", file=sys.stderr)
 
     # Verify one image OCRs correctly
-    test_path = os.path.join(outdir, "img0000.png")
+    test_path = os.path.join(outdir, "img0001.png")
     if os.path.exists(test_path):
         try:
             r = subprocess.run(["tesseract", test_path, "stdout"],
