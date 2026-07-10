@@ -50,6 +50,13 @@ type Options = {
   agentVariant?: string
   // Timeout (seconds) for cheap agent calls. Default 300.
   agentTimeoutSec?: number
+  // Bounded parallelism for the transform fan-out. Default 6.
+  concurrency?: number
+  // If a single transform has MORE than this many matched media parts,
+  // force deterministic local extraction (extract.py OCR) instead of per-image agent spawns. Default 24.
+  batchThreshold?: number
+  // Global wall-clock budget for the whole transform. Default 240.
+  transformBudgetSec?: number
 }
 
 const DEFAULT_MIMES = ["application/pdf", "audio/*", "video/*"]
@@ -120,6 +127,21 @@ function latestUserText(messages: any[]): string {
     // try/catch -> "" on any error
   }
   return ""
+}
+
+async function mapWithConcurrency<T>(items: T[], limit: number, worker: (item: T, index: number) => Promise<void>): Promise<void> {
+  let next = 0
+  const runners: Promise<void>[] = []
+  const run = async () => {
+    while (true) {
+      const i = next++
+      if (i >= items.length) return
+      await worker(items[i], i)
+    }
+  }
+  const n = Math.min(limit, items.length)
+  for (let k = 0; k < n; k++) runners.push(run())
+  await Promise.all(runners)
 }
 
 function imagePrompt(goal: string): string {
@@ -206,10 +228,13 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
   const maxChars = opts.maxChars ?? 60_000
   const model = opts.model ?? "base"
   const timeoutSec = opts.timeoutSec ?? 180
+  const concurrency = Math.max(1, opts.concurrency ?? 6)
+  const batchThreshold = opts.batchThreshold ?? 24
+  const transformBudgetMs = (opts.transformBudgetSec ?? 240) * 1000
 
   // in-memory result cache: path+mtime+size -> note text
   const cache = new Map<string, string>()
-  const MAX_CACHE = 64
+  const MAX_CACHE = 512
 
   // Resolve a FilePart's url/source to a local file path.
   const resolvePath = (part: any): string | null => {
@@ -352,17 +377,21 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
   }
 
   // Build the replacement text for one intercepted file part.
-  const buildNote = async (part: any, mime: string, userGoal: string): Promise<string> => {
+  // ctl.forceDeterministic — skip agent processing, use local extract only.
+  // ctl.deadline — wall-clock expiry; if exceeded (after cache check) return a fast pointer note.
+  // ctl.counters — optional debug counters incremented at each return path.
+  const buildNote = async (part: any, mime: string, userGoal: string, ctl: { forceDeterministic: boolean; deadline: number; counters?: { agent: number; deterministic: number; pointer: number; error: number } } = { forceDeterministic: false, deadline: Infinity }): Promise<string> => {
     const kind = kindForMime(mime)
     const path = resolvePath(part)
     const label = part?.filename || path || part?.url || "attachment"
-    const viaAgent = agentKinds.has(kind)
+    const viaAgent = agentKinds.has(kind) && !ctl.forceDeterministic
     const initialHeader = viaAgent
       ? `[media-guard] A ${kind} file ("${label}") was processed by a cheaper model instead of being sent to you as raw bytes (saves tokens; byte-exact values are preserved in key_metadata below).`
       : `[media-guard] A ${kind} file ("${label}") was attached but NOT sent to the ` +
         `model — this provider rejects ${mime} file parts (sending it would break the turn).`
 
     if (!path) {
+      if (ctl.counters) ctl.counters.pointer++
       return `${initialHeader}\nThe file isn't reachable as a local path, so its content ` +
         `couldn't be extracted automatically. ${skillHint(kind)}`
     }
@@ -376,6 +405,12 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
     const hit = cache.get(ckey)
     if (hit) return hit
 
+    // deadline guard — cached results always return; fresh work honours budget
+    if (Date.now() > ctl.deadline) {
+      if (ctl.counters) ctl.counters.pointer++
+      return `${initialHeader}\nThe per-turn media budget was exhausted before this file could be processed, so it was NOT sent to the model. ${skillHint(kind)} File: ${path}`
+    }
+
     const cacheSetAndEvict = (key: string, note: string): string => {
       cache.set(key, note)
       if (cache.size > MAX_CACHE) {
@@ -384,11 +419,12 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
       return note
     }
 
-    // IMAGE agent branch
-    if (kind === "image" && agentKinds.has("image") && path) {
+    // IMAGE agent branch (gated by forceDeterministic)
+    if (kind === "image" && agentKinds.has("image") && !ctl.forceDeterministic && path) {
       const digest = await runAgent([path], imagePrompt(userGoal))
       const json = digest ? extractJson(digest) : null
       if (json !== null) {
+        if (ctl.counters) ctl.counters.agent++
         const header = `[media-guard] An image ("${label}") was distilled to a JSON digest by a cheaper model instead of being sent as raw bytes (byte-exact values preserved in key_metadata).`
         const note = header + `\nIf you need the original, use the media_extract tool or read the file directly.\nFile: ${path}\n\n----- BEGIN MEDIA DIGEST (JSON) -----\n${json}\n----- END MEDIA DIGEST (JSON) -----`
         return cacheSetAndEvict(ckey, note)
@@ -396,12 +432,13 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
       // On failure fall through to deterministic OCR
       const fallbackHeader = `[media-guard] A ${kind} file ("${label}") was attached but NOT sent to the model — this provider rejects ${mime} file parts (sending it would break the turn).`
       const res = await runExtract(path, mime, maxChars)
+      if (ctl.counters) ctl.counters.deterministic++
       const note = extractNote(res, kind, path, fallbackHeader)
       return cacheSetAndEvict(ckey, note)
     }
 
-    // VIDEO branch
-    if (kind === "video" && agentKinds.has("video") && path) {
+    // VIDEO branch (gated by forceDeterministic)
+    if (kind === "video" && agentKinds.has("video") && !ctl.forceDeterministic && path) {
       const res = await runExtract(path, mime, maxChars) // frames + transcript
       const frames = Array.isArray(res?.meta?.frames) ? res.meta.frames : []
       const transcript = (res?.text || "")
@@ -410,6 +447,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
         const digest = await runAgent(useFrames, videoPrompt(userGoal, transcript))
         const json = digest ? extractJson(digest) : null
         if (json !== null) {
+          if (ctl.counters) ctl.counters.agent++
           const header = `[media-guard] A video ("${label}") was distilled by a cheaper multimodal model — ${frames.length} scene-sampled keyframes fused with its audio transcript — instead of being sent as raw bytes. Full transcript, frames, and the original video remain on disk.`
           const note = header + `\nUse the media_extract tool on the File path for the COMPLETE transcript, or read individual frames.\nFile: ${path}\nFrames dir: ${dirname(useFrames[0])}\n\n----- BEGIN VIDEO DIGEST (JSON) -----\n${json}\n----- END VIDEO DIGEST (JSON) -----`
           return cacheSetAndEvict(ckey, note)
@@ -417,13 +455,15 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
       }
       // fusion unavailable → fall back to deterministic transcript inline:
       const videoFallbackHeader = `[media-guard] A ${kind} file ("${label}") was attached but NOT sent to the model — this provider rejects ${mime} file parts (sending it would break the turn).`
+      if (ctl.counters) ctl.counters.deterministic++
       const note = extractNote(res, kind, path, videoFallbackHeader)
       return cacheSetAndEvict(ckey, note)
     }
 
-    // Otherwise (pdf / audio / non-agent kinds)
+    // Otherwise (pdf / audio / non-agent kinds / forced-deterministic image or video)
     const fallbackHeader = `[media-guard] A ${kind} file ("${label}") was attached but NOT sent to the model — this provider rejects ${mime} file parts (sending it would break the turn).`
     const res = await runExtract(path, mime, maxChars)
+    if (ctl.counters) ctl.counters.deterministic++
     const note = extractNote(res, kind, path, fallbackHeader)
     return cacheSetAndEvict(ckey, note)
   }
@@ -432,13 +472,16 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
     "experimental.chat.messages.transform": async (_input, output) => {
       let userGoal = ""
       try { userGoal = latestUserText(output.messages) } catch { userGoal = "" }
+
+      // Phase 1: collect ALL matching file-part locations across all messages
+      const matches: Array<{ msg: any; parts: any[]; index: number; part: any; mime: string }> = []
       for (const msg of output.messages ?? []) {
         let parts: any[]
         try {
           parts = msg.parts as any[]
           if (!Array.isArray(parts) || parts.length === 0) continue
         } catch { continue }
-        let touched = false
+        // keep a reference to the original array identity so in-place swap works
         for (let i = 0; i < parts.length; i++) {
           const p = parts[i]
           let isMatch = false
@@ -446,32 +489,62 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
             isMatch = p?.type === "file" && typeof p.mime === "string" && mimeMatches(p.mime, mimes)
           } catch { isMatch = false }
           if (!isMatch) continue
-          // Once a media part matches we MUST replace it — never leave raw bytes
-          // in the turn (fail SAFE, not fail open).
-          let text: string
-          try {
-            text = await buildNote(p, p.mime, userGoal)
-          } catch (e) {
-            const label = p?.filename || p?.url || "attachment"
-            text = `[media-guard] A media file ("${label}", ${p.mime}) was attached but its content could not be processed (${e instanceof Error ? e.message : String(e)}). It was NOT sent to the model, to avoid leaking raw bytes or breaking the turn. If you need its content, use the media_extract tool on its local path.`
-          }
-          try {
-            parts[i] = {
-              id: p.id,
-              sessionID: p.sessionID,
-              messageID: p.messageID,
-              type: "text",
-              text,
-              synthetic: true,
-            }
-            touched = true
-          } catch (e) {
-            console.error("[media-guard] failed to swap media part:", e)
-          }
+          matches.push({ msg, parts, index: i, part: p, mime: p.mime })
         }
-        if (touched) {
-          try { msg.parts = parts } catch (e) { console.error("[media-guard] failed to assign parts:", e) }
+      }
+
+      // Phase 2: decide batching / budget
+      const forceDeterministic = matches.length > batchThreshold
+      const deadline = Date.now() + transformBudgetMs
+
+      // Phase 3: process with bounded concurrency; every match MUST be replaced
+      const touchedMessages = new Set<any>()
+      const counters = { agent: 0, deterministic: 0, pointer: 0, error: 0 }
+
+      await mapWithConcurrency(matches, concurrency, async (m) => {
+        let text: string
+        try {
+          text = await buildNote(m.part, m.mime, userGoal, { forceDeterministic, deadline, counters })
+        } catch (e) {
+          counters.error++
+          const label = m.part?.filename || m.part?.url || "attachment"
+          text = `[media-guard] A media file ("${label}", ${m.mime}) was attached but its content could not be processed (${e instanceof Error ? e.message : String(e)}). It was NOT sent to the model, to avoid leaking raw bytes or breaking the turn. If you need its content, use the media_extract tool on its local path.`
         }
+        try {
+          m.parts[m.index] = {
+            id: m.part.id,
+            sessionID: m.part.sessionID,
+            messageID: m.part.messageID,
+            type: "text",
+            text,
+            synthetic: true,
+          }
+          touchedMessages.add(m.msg)
+        } catch (e) {
+          console.error("[media-guard] failed to swap media part:", e)
+        }
+      })
+
+      // Reassign parts to trigger any reactivity on touched messages
+      for (const msg of touchedMessages) {
+        try { msg.parts = msg.parts } catch (e) { console.error("[media-guard] failed to assign parts:", e) }
+      }
+
+      // Debug telemetry
+      if (process.env.MEDIA_GUARD_DEBUG) {
+        const elapsedMs = Date.now() - (deadline - transformBudgetMs)
+        console.error("[media-guard] " + JSON.stringify({
+          matches: matches.length,
+          forceDeterministic,
+          concurrency,
+          batchThreshold,
+          elapsedMs,
+          budgetMs: transformBudgetMs,
+          agent: counters.agent,
+          deterministic: counters.deterministic,
+          pointer: counters.pointer,
+          error: counters.error,
+        }))
       }
     },
 
