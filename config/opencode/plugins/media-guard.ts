@@ -58,6 +58,14 @@ type Options = {
   batchThreshold?: number
   // Global wall-clock budget for the whole transform. Default 240.
   transformBudgetSec?: number
+  // Route image/video digests through a LOCAL ollama vision model first.
+  visionEnabled?: boolean
+  // Ollama vision model tag.
+  visionModel?: string
+  // Ollama base URL.
+  visionBaseUrl?: string
+  // Per-request timeout for local vision (seconds). Default 120.
+  visionTimeoutSec?: number
 }
 
 const DEFAULT_MIMES = ["application/pdf", "audio/*", "video/*"]
@@ -210,6 +218,11 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
   const agentModel = opts.agentModel ?? cheapAgent.model ?? "github-copilot/gemini-3.5-flash"
   const agentVariant = opts.agentVariant ?? cheapAgent.effort ?? "medium"
   const agentTimeoutMs = (opts.agentTimeoutSec ?? 300) * 1000
+
+  const visionEnabled = opts.visionEnabled !== false
+  const visionModel = opts.visionModel ?? "qwen2.5vl:7b"
+  const visionBaseUrl = (opts.visionBaseUrl ?? "http://127.0.0.1:11434").replace(/\/+$/, "")
+  const visionTimeoutMs = (opts.visionTimeoutSec ?? 120) * 1000
 
   const mimes = [...(opts.mimes ?? DEFAULT_MIMES)]
   if (opts.ocrImages || agentKinds.has("image")) {
@@ -373,6 +386,51 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
     })
   }
 
+  const runLocalVision = async (paths: string[], promptText: string): Promise<string | null> => {
+    if (!visionEnabled) return null
+    const images: string[] = []
+    for (const p of paths) {
+      try {
+        images.push(Buffer.from(readFileSync(p)).toString("base64"))
+      } catch {
+        // skip unreadable files
+      }
+    }
+    if (images.length === 0) return null
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), visionTimeoutMs)
+      const resp = await fetch(`${visionBaseUrl}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: visionModel,
+          messages: [{ role: "user", content: promptText, images }],
+          stream: false,
+          format: "json",
+          options: { temperature: 0 },
+        }),
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      if (!resp.ok) {
+        if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to remote agent)")
+        return null
+      }
+      const json: any = await resp.json()
+      const content: string | undefined = json?.message?.content
+      if (!content) {
+        if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to remote agent)")
+        return null
+      }
+      if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] ok model=" + visionModel + " images=" + images.length)
+      return content
+    } catch {
+      if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to remote agent)")
+      return null
+    }
+  }
+
   const extractNote = (res: any, kind: string, path: string, header: string): string => {
     if (res && res.status === "ok" && res.text) {
       const trunc = res.truncated
@@ -435,11 +493,17 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
 
     // IMAGE agent branch (gated by forceDeterministic)
     if (kind === "image" && agentKinds.has("image") && !ctl.forceDeterministic && path) {
-      const digest = await runAgent([path], imagePrompt(userGoal))
+      const prompt = imagePrompt(userGoal)
+      let digest = visionEnabled ? await runLocalVision([path], prompt) : null
+      let viaLocal = digest !== null
+      if (digest === null) {
+        digest = await runAgent([path], prompt)
+      }
       const json = digest ? extractJson(digest) : null
       if (json !== null) {
         if (ctl.counters) ctl.counters.agent++
-        const header = `[media-guard] An image ("${label}") was distilled to a JSON digest by a cheaper model instead of being sent as raw bytes (byte-exact values preserved in key_metadata).`
+        const suffix = viaLocal ? " (local vision)" : ""
+        const header = `[media-guard] An image ("${label}") was distilled to a JSON digest by a cheaper model instead of being sent as raw bytes (byte-exact values preserved in key_metadata).${suffix}`
         const note = header + `\nIf you need the original, use the media_extract tool or read the file directly.\nFile: ${path}\n\n----- BEGIN MEDIA DIGEST (JSON) -----\n${json}\n----- END MEDIA DIGEST (JSON) -----`
         return cacheSetAndEvict(ckey, note)
       }
@@ -458,11 +522,17 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
       const transcript = (res?.text || "")
       if (frames.length) {
         const useFrames = frames.slice(0, MAX_AGENT_FRAMES)
-        const digest = await runAgent(useFrames, videoPrompt(userGoal, transcript))
+        const prompt = videoPrompt(userGoal, transcript)
+        let digest = visionEnabled ? await runLocalVision(useFrames, prompt) : null
+        let viaLocal = digest !== null
+        if (digest === null) {
+          digest = await runAgent(useFrames, prompt)
+        }
         const json = digest ? extractJson(digest) : null
         if (json !== null) {
           if (ctl.counters) ctl.counters.agent++
-          const header = `[media-guard] A video ("${label}") was distilled by a cheaper multimodal model — ${frames.length} scene-sampled keyframes fused with its audio transcript — instead of being sent as raw bytes. Full transcript, frames, and the original video remain on disk.`
+          const suffix = viaLocal ? " (local vision)" : ""
+          const header = `[media-guard] A video ("${label}") was distilled by a cheaper multimodal model — ${frames.length} scene-sampled keyframes fused with its audio transcript — instead of being sent as raw bytes. Full transcript, frames, and the original video remain on disk.${suffix}`
           const note = header + `\nUse the media_extract tool on the File path for the COMPLETE transcript, or read individual frames.\nFile: ${path}\nFrames dir: ${dirname(useFrames[0])}\n\n----- BEGIN VIDEO DIGEST (JSON) -----\n${json}\n----- END VIDEO DIGEST (JSON) -----`
           return cacheSetAndEvict(ckey, note)
         }
