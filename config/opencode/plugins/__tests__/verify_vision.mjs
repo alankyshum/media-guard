@@ -156,9 +156,8 @@ if (hasDigestHeader) {
     jsonPayload = match[1]
     try {
       const parsed = JSON.parse(jsonPayload)
-      parsedOk = true
-      const fullText = (parsed.full_text || parsed.summary || "").toString()
-      hasToken = fullText.includes("MEDIAGUARD OCR TOKEN 0001")
+      parsedOk = typeof parsed.full_text === "string"
+      hasToken = parsedOk && parsed.full_text.includes("MEDIAGUARD OCR TOKEN 0001")
     } catch {
       parsedOk = false
     }
@@ -193,7 +192,7 @@ console.log(`  (a) no image file parts remain: ${checkA_noFile ? "PASS" : "FAIL"
 console.log(`  (b) has JSON digest header: ${hasDigestHeader ? "PASS" : "FAIL"}`)
 console.log(`  (b) JSON parsed OK: ${parsedOk ? "PASS" : "FAIL"}`)
 console.log(`  (b) contains MEDIAGUARD OCR TOKEN 0001: ${hasToken ? "PASS" : "FAIL"}`)
-console.log(`  (c) vision ok telemetry: ${hasVisionOk ? "PASS" : "FAIL"}`)
+console.log(`  (c) local vision suffix: ${checkC ? "PASS" : "FAIL"}`)
 console.log(`  (c) agent count=${agentCount} deterministic=${deterministicCount}`)
 if (digestText) {
   console.log(`\n  Digest text (first 500 chars):`)
@@ -232,7 +231,7 @@ console.log(`\n========================================`)
 console.log(`Run #1: ${ms1}ms (vision cold) | Run #2: ${ms2}ms (cache)`)
 console.log(`(a) synthetic+no-file: ${checkA_type && checkA_noFile ? "PASS" : "FAIL"}`)
 console.log(`(b) OCR token in digest: ${checkB ? "PASS" : "FAIL"}`)
-console.log(`(c) local vision used (telemetry): ${checkC ? "PASS" : "FAIL"}`)
+console.log(`(c) local vision suffix: ${checkC ? "PASS" : "FAIL"}`)
 console.log(`(d) cache speedup: ${cacheSpeedup ? "PASS" : "FAIL"}`)
 console.log(`Final: ${pass ? "PASS" : "FAIL"}`)
 console.log(`========================================\n`)

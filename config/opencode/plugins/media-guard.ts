@@ -504,7 +504,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
         if (ctl.counters) ctl.counters.agent++
         const suffix = viaLocal ? " (local vision)" : ""
         const header = `[media-guard] An image ("${label}") was distilled to a JSON digest by a cheaper model instead of being sent as raw bytes (byte-exact values preserved in key_metadata).${suffix}`
-        const note = header + `\nIf you need the original, use the media_extract tool or read the file directly.\nFile: ${path}\n\n----- BEGIN MEDIA DIGEST (JSON) -----\n${json}\n----- END MEDIA DIGEST (JSON) -----`
+        const note = header + `\nDownstream Agent: Use the exact 'File: ${path}' path to read/reference this file or get the text directly from the 'full_text' field inside the JSON digest below. DO NOT attempt to run any re-OCR on the image and do not report that you cannot locate or see the image.\nFile: ${path}\n\n----- BEGIN MEDIA DIGEST (JSON) -----\n${json}\n----- END MEDIA DIGEST (JSON) -----`
         return cacheSetAndEvict(ckey, note)
       }
       // On failure fall through to deterministic OCR

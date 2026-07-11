@@ -19,6 +19,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { mkdtempSync, readFileSync, readdirSync, existsSync, statSync } from "node:fs"
 import { spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 
 const TEST_DIR = import.meta.dir
 const PLUGIN_FILE = join(TEST_DIR, "..", "media-guard.ts")
@@ -116,10 +117,29 @@ const partsA = outputA.parts
 const checkA_type = partsA[1].type === "text" && partsA[1].synthetic === true
 const checkA_noFile = !partsA.some(p => p?.type === "file" && p.mime?.startsWith("image/"))
 
+const textA = partsA[1]?.text || ""
+let checkA_fullText = false
+const digestMatch = textA.match(/----- BEGIN MEDIA DIGEST \(JSON\) -----\n([\s\S]*?)\n----- END MEDIA DIGEST \(JSON\) -----/)
+if (digestMatch) {
+  try {
+    const parsed = JSON.parse(digestMatch[1])
+    checkA_fullText = typeof parsed.full_text === "string" && parsed.full_text.length > 0
+  } catch (e) {
+    console.error("[harness] Failed to parse JSON digest:", e)
+  }
+}
+const h = createHash("sha256").update(imgBytes).digest("hex").slice(0, 32)
+const expectedPath = join(DATAURL_DIR, h + ".png")
+const checkA_fileHint = textA.includes(`File: ${expectedPath}`)
+const checkA_noReOCR = textA.includes("DO NOT attempt to run any re-OCR")
+
 console.log(`\n--- Instance A (default opts) ---`)
 console.log(`  Duration: ${msA}ms`)
 console.log(`  (a) part[1] is synthetic text: ${checkA_type ? "PASS" : "FAIL"}  (got type=${partsA[1]?.type}, synthetic=${partsA[1]?.synthetic})`)
 console.log(`  (b) no image file parts remain: ${checkA_noFile ? "PASS" : "FAIL"}`)
+console.log(`  (c) downstream contains 'full_text': ${checkA_fullText ? "PASS" : "FAIL"}`)
+console.log(`  (d) downstream contains exact 'File:': ${checkA_fileHint ? "PASS" : "FAIL"}`)
+console.log(`  (e) downstream prevents re-OCR: ${checkA_noReOCR ? "PASS" : "FAIL"}`)
 if (partsA[1]?.text) {
   console.log(`  text preview: ${partsA[1].text.slice(0, 120)}...`)
 }
@@ -186,13 +206,14 @@ if (hashedPaths.length > 0) {
 // ---- 7. Final PASS/FAIL ----
 const pass =
   checkA_type && checkA_noFile &&
+  checkA_fullText && checkA_fileHint && checkA_noReOCR &&
   checkB_type && checkB_noFile &&
   hasToken &&
   cacheSpeedup &&
   singleHashedFile
 
 console.log(`\n========================================`)
-console.log(`  Instance A: ${msA}ms | (a) ${checkA_type ? "PASS" : "FAIL"} (b) ${checkA_noFile ? "PASS" : "FAIL"}`)
+console.log(`  Instance A: ${msA}ms | (a) ${checkA_type ? "PASS" : "FAIL"} (b) ${checkA_noFile ? "PASS" : "FAIL"} (c) ${checkA_fullText ? "PASS" : "FAIL"} (d) ${checkA_fileHint ? "PASS" : "FAIL"} (e) ${checkA_noReOCR ? "PASS" : "FAIL"}`)
 console.log(`  Instance B: ${msB1}ms / ${msB2}ms | (c) ${hasToken ? "PASS" : "FAIL"} (d-cache) ${cacheSpeedup ? "PASS" : "FAIL"} (d-files) ${singleHashedFile ? "PASS" : "FAIL"}`)
 console.log(`  Final: ${pass ? "PASS" : "FAIL"}`)
 console.log(`========================================\n`)
