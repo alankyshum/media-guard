@@ -223,7 +223,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
   const agentTimeoutMs = (opts.agentTimeoutSec ?? 300) * 1000
 
   const visionEnabled = opts.visionEnabled !== false
-  const visionModel = opts.visionModel ?? "qwen3-vl:8b"
+  const visionModel = opts.visionModel ?? "gemma4:12b"
   const visionBaseUrl = (opts.visionBaseUrl ?? "http://127.0.0.1:11434").replace(/\/+$/, "")
   const visionNumCtx = opts.visionNumCtx ?? 16384
   const visionTimeoutMs = (opts.visionTimeoutSec ?? 120) * 1000
@@ -411,6 +411,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
           model: visionModel,
           messages: [{ role: "user", content: promptText, images }],
           stream: false,
+          think: false,
           format: "json",
           options: { temperature: 0, num_ctx: visionNumCtx },
         }),
