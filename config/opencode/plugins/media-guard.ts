@@ -66,6 +66,9 @@ type Options = {
   visionBaseUrl?: string
   // Per-request timeout for local vision (seconds). Default 120.
   visionTimeoutSec?: number
+  // Ollama context window (num_ctx) for local vision. Default 16384.
+  // Caps KV-cache memory; the model's max (262k) would balloon RAM to ~26GB.
+  visionNumCtx?: number
 }
 
 const DEFAULT_MIMES = ["application/pdf", "audio/*", "video/*"]
@@ -220,8 +223,9 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
   const agentTimeoutMs = (opts.agentTimeoutSec ?? 300) * 1000
 
   const visionEnabled = opts.visionEnabled !== false
-  const visionModel = opts.visionModel ?? "qwen2.5vl:7b"
+  const visionModel = opts.visionModel ?? "qwen3-vl:8b"
   const visionBaseUrl = (opts.visionBaseUrl ?? "http://127.0.0.1:11434").replace(/\/+$/, "")
+  const visionNumCtx = opts.visionNumCtx ?? 16384
   const visionTimeoutMs = (opts.visionTimeoutSec ?? 120) * 1000
 
   const mimes = [...(opts.mimes ?? DEFAULT_MIMES)]
@@ -408,7 +412,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
           messages: [{ role: "user", content: promptText, images }],
           stream: false,
           format: "json",
-          options: { temperature: 0 },
+          options: { temperature: 0, num_ctx: visionNumCtx },
         }),
         signal: controller.signal,
       })
