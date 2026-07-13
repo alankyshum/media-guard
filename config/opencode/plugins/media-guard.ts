@@ -215,7 +215,11 @@ function resolveCheapAgent(): { model?: string; effort?: string } {
   }
 }
 
-export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
+export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}) => {
+  const emit = async (message: string, level: "debug"|"info"|"warn"|"error" = "info", extra?: Record<string, unknown>) => {
+    try { await client?.app?.log({ body: { service: "media-guard", level, message, ...(extra ? { extra } : {}) } }) } catch {}
+  }
+
   const agentKinds = new Set(opts.agentKinds ?? ["image"])
   const cheapAgent = resolveCheapAgent()
   const agentModel = opts.agentModel ?? cheapAgent.model ?? "github-copilot/gemini-3.5-flash"
@@ -457,7 +461,8 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
   // ctl.forceDeterministic — skip agent processing, use local extract only.
   // ctl.deadline — wall-clock expiry; if exceeded (after cache check) return a fast pointer note.
   // ctl.counters — optional debug counters incremented at each return path.
-  const buildNote = async (part: any, mime: string, userGoal: string, ctl: { forceDeterministic: boolean; deadline: number; counters?: { agent: number; deterministic: number; pointer: number; error: number } } = { forceDeterministic: false, deadline: Infinity }): Promise<string> => {
+  // ctl.sink — optional sink to tag which path handled the file.
+  const buildNote = async (part: any, mime: string, userGoal: string, ctl: { forceDeterministic: boolean; deadline: number; counters?: { agent: number; deterministic: number; pointer: number; error: number }; sink?: { via?: string } } = { forceDeterministic: false, deadline: Infinity }): Promise<string> => {
     const kind = kindForMime(mime)
     const path = resolvePath(part)
     const label = part?.filename || path || part?.url || "attachment"
@@ -467,8 +472,11 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
       : `[media-guard] A ${kind} file ("${label}") was attached but NOT sent to the ` +
         `model — this provider rejects ${mime} file parts (sending it would break the turn).`
 
+    const win = (v: string) => { if (ctl.sink) ctl.sink.via = v }
+
     if (!path) {
       if (ctl.counters) ctl.counters.pointer++
+      win("unreachable")
       return `${initialHeader}\nThe file isn't reachable as a local path, so its content ` +
         `couldn't be extracted automatically. ${skillHint(kind)}`
     }
@@ -485,6 +493,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
     // deadline guard — cached results always return; fresh work honours budget
     if (Date.now() > ctl.deadline) {
       if (ctl.counters) ctl.counters.pointer++
+      win("skipped-budget")
       return `${initialHeader}\nThe per-turn media budget was exhausted before this file could be processed, so it was NOT sent to the model. ${skillHint(kind)} File: ${path}`
     }
 
@@ -510,6 +519,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
         const suffix = viaLocal ? " (local vision)" : ""
         const header = `[media-guard] An image ("${label}") was distilled to a JSON digest by a cheaper model instead of being sent as raw bytes (byte-exact values preserved in key_metadata).${suffix}`
         const note = header + `\nDownstream Agent: Use the exact 'File: ${path}' path to read/reference this file or get the text directly from the 'full_text' field inside the JSON digest below. DO NOT attempt to run any re-OCR on the image and do not report that you cannot locate or see the image.\nFile: ${path}\n\n----- BEGIN MEDIA DIGEST (JSON) -----\n${json}\n----- END MEDIA DIGEST (JSON) -----`
+        win(viaLocal ? "local-vision" : "remote-agent")
         return cacheSetAndEvict(ckey, note)
       }
       // On failure fall through to deterministic OCR
@@ -517,6 +527,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
       const res = await runExtract(path, mime, maxChars)
       if (ctl.counters) ctl.counters.deterministic++
       const note = extractNote(res, kind, path, fallbackHeader)
+      win("ocr")
       return cacheSetAndEvict(ckey, note)
     }
 
@@ -539,6 +550,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
           const suffix = viaLocal ? " (local vision)" : ""
           const header = `[media-guard] A video ("${label}") was distilled by a cheaper multimodal model — ${frames.length} scene-sampled keyframes fused with its audio transcript — instead of being sent as raw bytes. Full transcript, frames, and the original video remain on disk.${suffix}`
           const note = header + `\nUse the media_extract tool on the File path for the COMPLETE transcript, or read individual frames.\nFile: ${path}\nFrames dir: ${dirname(useFrames[0])}\n\n----- BEGIN VIDEO DIGEST (JSON) -----\n${json}\n----- END VIDEO DIGEST (JSON) -----`
+          win(viaLocal ? "local-vision" : "remote-agent")
           return cacheSetAndEvict(ckey, note)
         }
       }
@@ -546,6 +558,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
       const videoFallbackHeader = `[media-guard] A ${kind} file ("${label}") was attached but NOT sent to the model — this provider rejects ${mime} file parts (sending it would break the turn).`
       if (ctl.counters) ctl.counters.deterministic++
       const note = extractNote(res, kind, path, videoFallbackHeader)
+      win("extract")
       return cacheSetAndEvict(ckey, note)
     }
 
@@ -554,6 +567,7 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
     const res = await runExtract(path, mime, maxChars)
     if (ctl.counters) ctl.counters.deterministic++
     const note = extractNote(res, kind, path, fallbackHeader)
+    win("extract")
     return cacheSetAndEvict(ckey, note)
   }
 
@@ -567,19 +581,24 @@ export const MediaGuardPlugin: Plugin = async ({ $ }, opts: Options = {}) => {
     const forceDeterministic = matches.length > batchThreshold
     const deadline = Date.now() + transformBudgetMs
     const start = Date.now()
-    await mapWithConcurrency(matches, concurrency, async (m) => {
+    await emit(`distilling ${matches.length} media file(s) locally before the model runs — the reply will appear once this finishes`, "info", { count: matches.length, concurrency, forceDeterministic })
+    await mapWithConcurrency(matches, concurrency, async (m, i) => {
+      const label = m.part?.filename || m.part?.url || "attachment"
+      await emit(`processing ${i + 1}/${matches.length}: ${label}`)
+      const sink: { via?: string } = {}
       let text: string
       try {
-        text = await buildNote(m.part, m.mime, userGoal, { forceDeterministic, deadline, counters })
+        text = await buildNote(m.part, m.mime, userGoal, { forceDeterministic, deadline, counters, sink })
       } catch (e) {
         counters.error++
-        const label = m.part?.filename || m.part?.url || "attachment"
         text = `[media-guard] A media file ("${label}", ${m.mime}) was attached but its content could not be processed (${e instanceof Error ? e.message : String(e)}). It was NOT sent to the model, to avoid leaking raw bytes or breaking the turn. If you need its content, use the media_extract tool on its local path.`
       }
+      await emit(`done ${i + 1}/${matches.length}: ${label} via ${sink.via ?? "unknown"}`)
       try {
         m.parts[m.index] = { id: m.part.id, sessionID: m.part.sessionID, messageID: m.part.messageID, type: "text", text, synthetic: true }
       } catch (e) { console.error("[media-guard] failed to swap media part:", e) }
     })
+    await emit(`media distillation complete in ${Date.now() - start}ms`, "info", { ...counters })
     return { forceDeterministic, elapsedMs: Date.now() - start }
   }
 
