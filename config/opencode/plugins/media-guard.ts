@@ -72,6 +72,8 @@ type Options = {
 }
 
 const DEFAULT_MIMES = ["application/pdf", "audio/*", "video/*"]
+const ZIP_MIMES = ["application/zip", "application/x-zip", "application/x-zip-compressed", "application/zip-compressed", "multipart/x-zip"]
+const MAX_ZIP_DEPTH = 2
 const EXTRACT = new URL("./media/extract.py", import.meta.url).pathname
 const DATAURL_DIR = join(tmpdir(), "opencode-media-guard-data")
 
@@ -102,7 +104,13 @@ function kindForMime(mime: string): string {
   if (m.startsWith("audio/")) return "audio"
   if (m.startsWith("video/")) return "video"
   if (m.startsWith("image/")) return "image"
+  if (m === "application/zip" || (m.startsWith("application/") && m.includes("zip"))) return "zip"
   return "unknown"
+}
+
+function looksLikeZip(part: any): boolean {
+  const name = String(part?.filename || part?.url || "").toLowerCase()
+  return name.endsWith(".zip")
 }
 
 const MAX_AGENT_FRAMES = 16
@@ -247,6 +255,9 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
       mimes.push(p)
     }
   }
+  for (const z of ZIP_MIMES) {
+    if (!mimes.includes(z)) mimes.push(z)
+  }
 
   const maxChars = opts.maxChars ?? 60_000
   const model = opts.model ?? "base"
@@ -283,6 +294,7 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
           : pMime.includes("png") ? ".png"
           : pMime.includes("jpeg") || pMime.includes("jpg") ? ".jpg"
           : pMime.includes("pdf") ? ".pdf"
+          : pMime.includes("zip") ? ".zip"
           : pMime.includes("audio") ? ".bin"
           : pMime.includes("video") ? ".bin"
           : ".bin"
@@ -462,7 +474,7 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
   // ctl.deadline — wall-clock expiry; if exceeded (after cache check) return a fast pointer note.
   // ctl.counters — optional debug counters incremented at each return path.
   // ctl.sink — optional sink to tag which path handled the file.
-  const buildNote = async (part: any, mime: string, userGoal: string, ctl: { forceDeterministic: boolean; deadline: number; counters?: { agent: number; deterministic: number; pointer: number; error: number }; sink?: { via?: string } } = { forceDeterministic: false, deadline: Infinity }): Promise<string> => {
+  const buildNote = async (part: any, mime: string, userGoal: string, ctl: { forceDeterministic: boolean; deadline: number; counters?: { agent: number; deterministic: number; pointer: number; error: number }; sink?: { via?: string }; depth?: number } = { forceDeterministic: false, deadline: Infinity }): Promise<string> => {
     const kind = kindForMime(mime)
     const path = resolvePath(part)
     const label = part?.filename || path || part?.url || "attachment"
@@ -503,6 +515,45 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
         cache.delete(cache.keys().next().value as string)
       }
       return note
+    }
+
+    // ZIP / archive branch — decompress locally, then run each extracted file
+    // back through this SAME media-guard pipeline (recursively, depth-capped).
+    if (kind === "zip") {
+      const depth = ctl.depth ?? 0
+      const res = await runExtract(path, "application/zip", maxChars)
+      const files: any[] = Array.isArray(res?.meta?.files) ? res.meta.files : []
+      const listing = String(res?.text || "").trim()
+      if (files.length === 0) {
+        if (ctl.counters) ctl.counters.pointer++
+        win("zip-empty")
+        const why = res?.detail ? ` (${res.detail})` : ""
+        return cacheSetAndEvict(ckey, `[media-guard] A zip archive ("${label}") was attached but no extractable files were found${why}. It was NOT sent to the model. File: ${path}`)
+      }
+      const dest = res?.meta?.dest ?? dirname(files[0].path)
+      const zipHeader = `[media-guard] A zip archive ("${label}") was attached but NOT sent to the model as raw bytes. It was decompressed locally and each of its ${files.length} file(s) was processed by media-guard (same pipeline). Archive dir: ${dest}`
+      if (depth >= MAX_ZIP_DEPTH) {
+        if (ctl.counters) ctl.counters.pointer++
+        win("zip-maxdepth")
+        return cacheSetAndEvict(ckey, `${zipHeader}\nNested-archive depth limit (${MAX_ZIP_DEPTH}) reached — inner archive entries were left on disk, not expanded.\n\n${listing}`)
+      }
+      const childNotes: string[] = new Array(files.length)
+      await mapWithConcurrency(files, concurrency, async (f: any, idx: number) => {
+        const childName = f.name || (f.path ? String(f.path).split("/").pop() : "entry")
+        const childPart = { filename: childName, url: `file://${f.path}`, source: { path: f.path } }
+        const childMime = f.mime || ""
+        const childSink: { via?: string } = {}
+        let note: string
+        try {
+          note = await buildNote(childPart, childMime, userGoal, { forceDeterministic: ctl.forceDeterministic, deadline: ctl.deadline, counters: ctl.counters, sink: childSink, depth: depth + 1 })
+        } catch (e) {
+          note = `[media-guard] Zip entry "${childName}" could not be processed (${e instanceof Error ? e.message : String(e)}).`
+        }
+        childNotes[idx] = `===== ZIP ENTRY ${idx + 1}/${files.length}: ${childName} [${f.kind || "?"}] (via ${childSink.via ?? "unknown"}) =====\n${note}`
+      })
+      win("zip")
+      const combined = `${zipHeader}\n\n${listing}\n\n` + childNotes.join("\n\n")
+      return cacheSetAndEvict(ckey, combined)
     }
 
     // IMAGE agent branch (gated by forceDeterministic)
@@ -613,8 +664,10 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
         for (let i = 0; i < parts.length; i++) {
           const p = parts[i]
           let isMatch = false
-          try { isMatch = p?.type === "file" && typeof p.mime === "string" && mimeMatches(p.mime, mimes) } catch {}
-          if (isMatch) matches.push({ parts, index: i, part: p, mime: p.mime })
+          const zipByName = (() => { try { return looksLikeZip(p) } catch { return false } })()
+          try { isMatch = p?.type === "file" && ((typeof p.mime === "string" && mimeMatches(p.mime, mimes)) || zipByName) } catch { isMatch = false }
+          const matchMime = zipByName ? "application/zip" : p.mime
+          if (isMatch) matches.push({ parts, index: i, part: p, mime: matchMime })
         }
         if (matches.length === 0) return
         const counters = { agent: 0, deterministic: 0, pointer: 0, error: 0 }
@@ -653,11 +706,13 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
         for (let i = 0; i < parts.length; i++) {
           const p = parts[i]
           let isMatch = false
+          const zipByName = (() => { try { return looksLikeZip(p) } catch { return false } })()
           try {
-            isMatch = p?.type === "file" && typeof p.mime === "string" && mimeMatches(p.mime, mimes)
+            isMatch = p?.type === "file" && ((typeof p.mime === "string" && mimeMatches(p.mime, mimes)) || zipByName)
           } catch { isMatch = false }
           if (!isMatch) continue
-          matches.push({ msg, parts, index: i, part: p, mime: p.mime })
+          const matchMime = zipByName ? "application/zip" : p.mime
+          matches.push({ msg, parts, index: i, part: p, mime: matchMime })
         }
       }
 
