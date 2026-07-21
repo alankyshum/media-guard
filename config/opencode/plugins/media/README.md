@@ -31,14 +31,32 @@ Prints one JSON object, always exits 0. `status` is one of
 
 Backends (all optional, degrade gracefully):
 
-- **pdf** → `pdftotext` (poppler) → PyMuPDF (`fitz`) → `pypdf`
+- **pdf** → `pdftotext` → PyMuPDF → `pypdf` → [if no text] rasterize + VLM OCR → PyMuPDF `get_textpage_ocr`
 - **audio/video** → `whisper` CLI (ffmpeg-decoded), default model `base`
-- **image** → `tesseract` OCR
+- **image** → Ollama VLM (`qwen3-vl:32b`) → `tesseract`
 - **text** → read directly
 
+## VLM OCR
+
+Image OCR uses the local Ollama VLM first. Scanned-PDF OCR only runs when direct
+text extraction produces no text: pages are rasterized by the PyMuPDF-capable
+interpreter in the `tool--pdf` skill venv, then sent to the VLM. If Ollama or the
+model is unavailable, extraction falls back to tesseract/PyMuPDF OCR. Set
+`OCR_VLM_ENABLED=0` to force the classic path.
+
+Optional environment variables:
+
+- `OCR_VLM_ENABLED` — default `1`; set `0` to disable VLM OCR.
+- `OCR_VLM_BASE_URL` — default `http://127.0.0.1:11434`.
+- `OCR_VLM_MODEL` — default `qwen3-vl:32b`.
+- `OCR_VLM_NUM_CTX` — default `16384`.
+- `OCR_PDF_MAX_PAGES` — default `20`; maximum scanned-PDF pages OCR'd.
+
 Expensive results (transcription, OCR) are cached on disk under
-`$TMPDIR/opencode-media-cache`, keyed by `sha256(path,size,mtime,kind,model,max_chars)`,
-so repeated turns and restarts are cheap. Use `--no-cache` to bypass.
+`$TMPDIR/opencode-media-cache`, keyed by
+`sha256(path,size,mtime,kind,model,max_chars,vlm-enabled,vlm-model,pdf-max-pages)`,
+so switching VLM state, model, or scanned-PDF page cap invalidates stale OCR.
+Repeated turns and restarts are cheap. Use `--no-cache` to bypass.
 
 ## Relationship to skills
 
@@ -54,4 +72,5 @@ slimmed. See each skill's SKILL.md note.
 bash ~/.config/opencode/plugins/media/setup.sh   # report
 brew install poppler ffmpeg tesseract            # common installs
 pip install -U openai-whisper pymupdf pypdf
+ollama pull qwen3-vl:32b
 ```

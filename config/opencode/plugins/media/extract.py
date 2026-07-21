@@ -36,13 +36,20 @@ sha256(path,size,mtime,kind,model,max_chars) so restarts and repeated turns are
 cheap.
 """
 import argparse
+import base64
 import hashlib
 import json
+import mimetypes
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
 
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "opencode-media-cache")
 
@@ -56,6 +63,31 @@ AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus", "
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg", ".flv", ".wmv"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 TEXT_EXT = {".txt", ".md", ".csv", ".log", ".json", ".yaml", ".yml", ".srt", ".vtt"}
+
+ARCHIVE_EXT = {".zip"}
+ZIP_MIMES = {
+    "application/zip",
+    "application/x-zip",
+    "application/x-zip-compressed",
+    "application/zip-compressed",
+    "multipart/x-zip",
+}
+
+# Zip safety caps (guard against zip bombs / resource exhaustion)
+ZIP_MAX_FILES = 512
+ZIP_MAX_TOTAL_BYTES = 512 * 1024 * 1024  # 512 MiB uncompressed
+
+OCR_VLM_BASE_URL = os.environ.get("OCR_VLM_BASE_URL", "http://127.0.0.1:11434")
+OCR_VLM_MODEL = os.environ.get("OCR_VLM_MODEL", "qwen3-vl:32b")
+OCR_VLM_NUM_CTX = int(os.environ.get("OCR_VLM_NUM_CTX", "16384"))
+try:
+    OCR_PDF_MAX_PAGES = int(os.environ.get("OCR_PDF_MAX_PAGES", "20"))
+except (TypeError, ValueError):
+    OCR_PDF_MAX_PAGES = 20
+
+
+def _vlm_enabled():
+    return os.environ.get("OCR_VLM_ENABLED", "1").strip().lower() not in {"0", "false"}
 
 
 def which(name):
@@ -74,6 +106,8 @@ def classify(path, mime, kind_hint):
         return "video"
     if m.startswith(IMAGE_PREFIX):
         return "image"
+    if m in ZIP_MIMES:
+        return "archive"
     ext = os.path.splitext(path)[1].lower()
     if ext in PDF_EXT:
         return "pdf"
@@ -83,17 +117,20 @@ def classify(path, mime, kind_hint):
         return "video"
     if ext in IMAGE_EXT:
         return "image"
+    if ext in ARCHIVE_EXT:
+        return "archive"
     if ext in TEXT_EXT or (m.startswith("text/")):
         return "text"
     return "unknown"
 
 
 def cache_key(path, kind, model, max_chars):
+    ocr_sig = f"{_vlm_enabled()}:{OCR_VLM_MODEL}:{OCR_PDF_MAX_PAGES}"
     try:
         st = os.stat(path)
-        sig = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime_ns)}|{kind}|{model}|{max_chars}"
+        sig = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime_ns)}|{kind}|{model}|{max_chars}|{ocr_sig}"
     except OSError:
-        sig = f"{os.path.abspath(path)}|nostat|{kind}|{model}|{max_chars}"
+        sig = f"{os.path.abspath(path)}|nostat|{kind}|{model}|{max_chars}|{ocr_sig}"
     return hashlib.sha256(sig.encode()).hexdigest()
 
 
@@ -127,6 +164,25 @@ def run(cmd, timeout):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _fitz_python():
+    """Return an interpreter that can import fitz, or None."""
+    candidates = [
+        "/Users/alanshum/Documents/dotfiles/config/claude-code/skills/tool--pdf/scripts/.venv/bin/python",
+        os.path.expanduser("~/.claude/skills/tool--pdf/scripts/.venv/bin/python"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    if sys.executable:
+        try:
+            rc, _, _ = run([sys.executable, "-c", "import fitz"], 2)
+            if rc == 0:
+                return sys.executable
+        except Exception:
+            pass
+    return None
+
+
 # ---------- PDF ----------
 def extract_pdf(path, timeout):
     # 1) pdftotext (poppler)
@@ -142,10 +198,10 @@ def extract_pdf(path, timeout):
     # 2) PyMuPDF
     try:
         import fitz  # type: ignore
-        doc = fitz.open(path)
-        txt = "\n\n".join(pg.get_text() for pg in doc)
-        if txt.strip():
-            return txt, "pymupdf", {"pages": doc.page_count}
+        with fitz.open(path) as doc:
+            txt = "\n\n".join(pg.get_text() for pg in doc)
+            if txt.strip():
+                return txt, "pymupdf", {"pages": doc.page_count}
     except Exception:
         pass
     # 3) pypdf
@@ -157,7 +213,116 @@ def extract_pdf(path, timeout):
             return txt, "pypdf", {"pages": len(reader.pages)}
     except Exception:
         pass
-    return None, None, {}
+    # 4) OCR rendered PDF pages with the local vision model. fitz is deliberately
+    # loaded in its skill venv, not in this runtime process.
+    fpy = _fitz_python()
+    if not fpy:
+        return None, None, {"why": "no fitz-capable interpreter for scanned-pdf OCR"}
+
+    raster_prog = r'''import json, os, sys, fitz
+pdf_path, out_dir, max_pages = sys.argv[1:]
+doc = fitz.open(pdf_path)
+paths = []
+for page_num in range(min(doc.page_count, int(max_pages))):
+    pix = doc[page_num].get_pixmap(matrix=fitz.Matrix(2, 2))
+    png_path = os.path.join(out_dir, "page_%03d.png" % (page_num + 1))
+    pix.save(png_path)
+    paths.append(png_path)
+print(json.dumps(paths))'''
+    page_count = 0
+    vlm_meta = {}
+    tmpdir = tempfile.mkdtemp(prefix="oc-pdf-ocr-")
+    try:
+        deadline = time.monotonic() + timeout
+        try:
+            raster_timeout = max(1.0, deadline - time.monotonic())
+            rc, out, err = run([fpy, "-c", raster_prog, path, tmpdir, str(OCR_PDF_MAX_PAGES)], raster_timeout)
+            if rc != 0:
+                return None, None, {"why": f"PDF rasterization failed: {(err or out or 'unknown error')[-400:]}"}
+            png_paths = json.loads(out)
+            page_count = len(png_paths)
+        except subprocess.TimeoutExpired:
+            raise
+        except Exception as e:
+            return None, None, {"why": f"PDF rasterization unavailable: {e}"}
+
+        if _vlm_enabled():
+            page_text = []
+            failed_pages = []
+            for page_num, png_path in enumerate(png_paths, 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 5:
+                    skipped_pages = list(range(page_num, page_count + 1))
+                    failed_pages.extend(skipped_pages)
+                    vlm_meta["skipped_pages"] = skipped_pages
+                    break
+                try:
+                    page_text_item, _, page_meta = _run_vlm_ocr(png_path, min(remaining, timeout))
+                    if page_text_item and page_text_item.strip():
+                        page_text.append((page_num, page_text_item.strip()))
+                    else:
+                        failed_pages.append(page_num)
+                        vlm_meta = page_meta or vlm_meta
+                        if page_meta and page_meta.get("timeout"):
+                            skipped_pages = list(range(page_num + 1, page_count + 1))
+                            failed_pages.extend(skipped_pages)
+                            vlm_meta["skipped_pages"] = skipped_pages
+                            break
+                except Exception:
+                    failed_pages.append(page_num)
+            if page_text:
+                joined = "\n\n".join(
+                    f"----- Page {page_num} -----\n\n{text}"
+                    for page_num, text in page_text
+                )
+                return joined, "qwen3-vl-ocr-pdf", {
+                    "pages": page_count,
+                    "ocr_pages": len(page_text),
+                    "failed_pages": failed_pages,
+                    **({"vlm": vlm_meta} if vlm_meta else {}),
+                    "rasterizer": fpy,
+                }
+
+        # 5) Cheap local OCR fallback, also executed in fitz's interpreter.
+        local_prog = r'''import json, sys, fitz
+doc = fitz.open(sys.argv[1])
+items, failed = [], []
+for page_num in range(min(doc.page_count, int(sys.argv[2]))):
+    try:
+        page = doc[page_num]
+        textpage = page.get_textpage_ocr(flags=0, language="chi_sim+chi_tra")
+        text = page.get_text("text", textpage=textpage)
+        if text and text.strip(): items.append([page_num + 1, text.strip()])
+        else: failed.append(page_num + 1)
+    except Exception: failed.append(page_num + 1)
+print(json.dumps({"items": items, "failed": failed}))'''
+        try:
+            remaining = max(1.0, deadline - time.monotonic())
+            rc, out, err = run([fpy, "-c", local_prog, path, str(page_count)], remaining)
+            if rc != 0:
+                local_result = {"items": [], "failed": list(range(1, page_count + 1))}
+            else:
+                local_result = json.loads(out)
+        except subprocess.TimeoutExpired:
+            raise
+        except Exception:
+            local_result = {"items": [], "failed": list(range(1, page_count + 1))}
+        local_text = [(int(n), text) for n, text in local_result.get("items", [])]
+        local_failed = local_result.get("failed", [])
+        if local_text:
+            joined = "\n\n".join(
+                f"----- Page {page_num} -----\n\n{text}" for page_num, text in local_text
+            )
+            return joined, "pymupdf-ocr", {
+                "pages": page_count,
+                "ocr_pages": len(local_text),
+                "failed_pages": local_failed,
+                "rasterizer": fpy,
+            }
+        why = vlm_meta.get("why", "vision OCR produced no text") if vlm_meta else "PyMuPDF OCR produced no text"
+        return None, None, {"why": why, "pages": page_count, "failed_pages": local_failed, "vlm": vlm_meta, "rasterizer": fpy}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------- audio / video via whisper ----------
@@ -314,6 +479,53 @@ def extract_video(path, model, timeout):
 
 
 # ---------- image via tesseract ----------
+def _run_vlm_ocr(img_path, timeout):
+    if not _vlm_enabled():
+        return None, None, {"why": "vlm ocr disabled"}
+    try:
+        with open(img_path, "rb") as f:
+            image_b64 = base64.b64encode(f.read()).decode("ascii")
+        body = {
+            "model": OCR_VLM_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "Transcribe ALL visible text faithfully. Preserve reading order "
+                    "and line breaks. Keep tables as best-effort text. Output ONLY "
+                    "the transcribed text with no commentary. Never invent text."
+                ),
+                "images": [image_b64],
+            }],
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": OCR_VLM_NUM_CTX},
+        }
+        request = urllib.request.Request(
+            OCR_VLM_BASE_URL.rstrip("/") + "/api/chat",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        text = ((payload.get("message") or {}).get("content") or "").strip()
+        if text:
+            return text, "qwen3-vl-ocr", {"model": OCR_VLM_MODEL}
+        return None, None, {"why": "qwen3-vl returned no text"}
+    except (socket.timeout, TimeoutError) as e:
+        return None, None, {"why": "vlm ocr timeout", "timeout": True}
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (socket.timeout, TimeoutError)):
+            return None, None, {"why": "vlm ocr timeout", "timeout": True}
+        reason = str(e) or e.__class__.__name__
+        return None, None, {"why": reason[-400:]}
+    except Exception as e:
+        reason = str(e) or e.__class__.__name__
+        if isinstance(e, urllib.error.HTTPError):
+            reason = f"HTTP {e.code}: {e.reason}"
+        return None, None, {"why": reason[-400:]}
+
+
 def _run_tesseract(img_path, timeout):
     proc = subprocess.run(
         ["tesseract", img_path, "stdout"],
@@ -325,15 +537,25 @@ def _run_tesseract(img_path, timeout):
 
 
 def extract_image(path, timeout):
+    deadline = time.monotonic() + timeout
+    text, tool, meta = _run_vlm_ocr(path, max(0.1, deadline - time.monotonic()))
+    if text and text.strip():
+        return text, tool, meta
     if not which("tesseract"):
-        return None, None, {"why": "tesseract not installed"}
+        fallback_meta = {"why": "tesseract not installed"}
+        if meta:
+            fallback_meta["vlm"] = meta
+        return None, None, fallback_meta
     # 1) direct
-    try:
-        rc, out, err = _run_tesseract(path, timeout)
-    except subprocess.TimeoutExpired:
-        raise
-    if rc == 0 and out.strip():
-        return out, "tesseract", {}
+        try:
+            rc, out, err = _run_tesseract(path, max(5.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise
+        if rc == 0 and out.strip():
+            fallback_meta = {}
+            if meta:
+                fallback_meta["vlm"] = meta
+            return out, "tesseract", fallback_meta
 
     # 2) leptonica on this platform can fail to open certain paths (notably
     #    files under literal /tmp) or odd filenames. Retry against a copy in a
@@ -347,15 +569,91 @@ def extract_image(path, timeout):
         except Exception as e:
             return None, None, {"why": f"tesseract failed and copy for retry failed: {e}"}
         try:
-            rc2, out2, err2 = _run_tesseract(workfile, timeout)
+            rc2, out2, err2 = _run_tesseract(workfile, max(5.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             raise
         if rc2 == 0 and out2.strip():
-            return out2, "tesseract", {"retried_via": "tmpdir-copy"}
+            fallback_meta = {"retried_via": "tmpdir-copy"}
+            if meta:
+                fallback_meta["vlm"] = meta
+            return out2, "tesseract", fallback_meta
         why = (err2 or err or "tesseract produced no text")[-400:]
-        return None, None, {"why": why}
+        fallback_meta = {"why": why}
+        if meta:
+            fallback_meta["vlm"] = meta
+        return None, None, fallback_meta
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------- zip archive ----------
+def _safe_extract_target(dest_root, name):
+    """Resolve a zip member name under dest_root, rejecting zip-slip / absolute paths."""
+    target = os.path.realpath(os.path.join(dest_root, name))
+    base = os.path.realpath(dest_root)
+    if target == base:
+        return None
+    if not target.startswith(base + os.sep):
+        return None
+    return target
+
+
+def extract_zip(path):
+    if not zipfile.is_zipfile(path):
+        return None, None, {"why": "not a valid zip archive"}
+    key = cache_key(path, "archive", "unzip", 0)
+    dest = os.path.join(CACHE_DIR, "unzip", key)
+    files = []
+    total = 0
+    truncated = False
+    skipped = []
+    try:
+        os.makedirs(dest, exist_ok=True)
+        with zipfile.ZipFile(path) as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            for info in infos:
+                if len(files) >= ZIP_MAX_FILES:
+                    truncated = True
+                    break
+                target = _safe_extract_target(dest, info.filename)
+                if target is None:
+                    skipped.append(info.filename)
+                    continue
+                if total + info.file_size > ZIP_MAX_TOTAL_BYTES:
+                    truncated = True
+                    break
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if not (os.path.exists(target) and os.path.getsize(target) == info.file_size):
+                    with zf.open(info) as src, open(target, "wb") as out:
+                        shutil.copyfileobj(src, out, 1024 * 64)
+                total += info.file_size
+                kind = classify(target, "", "auto")
+                guessed_mime, _ = mimetypes.guess_type(target)
+                files.append({
+                    "path": target,
+                    "name": info.filename,
+                    "kind": kind,
+                    "mime": guessed_mime or "",
+                    "size": info.file_size,
+                })
+    except Exception as e:
+        return None, None, {"why": f"zip extraction failed: {e}"}
+    lines = [f"Archive contained {len(files)} extractable file(s), unpacked to {dest}:"]
+    for f in files:
+        lines.append(f"  - {f['name']} [{f['kind']}, {f['size']} bytes]")
+    if skipped:
+        lines.append(f"Skipped {len(skipped)} unsafe entr(y/ies) (path traversal): " + ", ".join(skipped[:10]))
+    if truncated:
+        lines.append(f"NOTE: extraction truncated at {ZIP_MAX_FILES} files / {ZIP_MAX_TOTAL_BYTES} bytes cap.")
+    text = "\n".join(lines)
+    meta = {
+        "files": files,
+        "file_count": len(files),
+        "dest": dest,
+        "truncated": truncated,
+        "skipped": skipped,
+    }
+    return text, "zipfile", meta
 
 
 # ---------- plain text ----------
@@ -440,6 +738,11 @@ def main():
                 meta = whisper_meta
         elif kind == "image":
             text, tool, meta = extract_image(path, args.timeout)
+        elif kind == "archive":
+            try:
+                text, tool, meta = extract_zip(path)
+            except Exception as e:
+                text, tool, meta = None, None, {"why": f"extract_zip raised exception: {str(e)}"}
         elif kind == "text":
             text, tool, meta = extract_text(path)
         else:
