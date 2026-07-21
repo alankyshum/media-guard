@@ -167,7 +167,7 @@ def run(cmd, timeout):
 def _fitz_python():
     """Return an interpreter that can import fitz, or None."""
     candidates = [
-        "/Users/alanshum/Documents/dotfiles/config/claude-code/skills/tool--pdf/scripts/.venv/bin/python",
+        os.path.expanduser("~/Documents/dotfiles/config/claude-code/skills/tool--pdf/scripts/.venv/bin/python"),
         os.path.expanduser("~/.claude/skills/tool--pdf/scripts/.venv/bin/python"),
     ]
     for candidate in candidates:
