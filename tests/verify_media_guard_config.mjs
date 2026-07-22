@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { spawnSync } from "node:child_process"
 
 const testDir = import.meta.dir
-const configPath = join(testDir, "..", "..", "opencode.jsonc")
+const configPath = process.env.MEDIA_GUARD_CONFIG || join(testDir, "..", "..", "..", "config", "opencode", "opencode.jsonc")
 const pluginPath = join(testDir, "..", "media-guard.ts")
 const benchmarkPath = join(testDir, "benchmark_local_vision.mjs")
 const config = readFileSync(configPath, "utf8")
