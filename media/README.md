@@ -83,7 +83,7 @@ fixture and independently sourced oracle without copying either into source
 control:
 
 ```bash
-bun ~/.config/opencode/plugins/__tests__/benchmark_local_vision.mjs \
+bun ~/.config/opencode/external/media-guard/tests/benchmark_local_vision.mjs \
   --manifest /private/path/manifest.json --check
 ```
 
@@ -130,7 +130,7 @@ slimmed. See each skill's SKILL.md note.
 ## Install missing backends
 
 ```bash
-bash ~/.config/opencode/plugins/media/setup.sh   # report
+bash ~/.config/opencode/external/media-guard/media/setup.sh   # report
 brew install poppler ffmpeg tesseract            # common installs
 pip install -U openai-whisper pymupdf pypdf
 ollama pull qwen3-vl:32b
