@@ -33,6 +33,8 @@ for (const d of [DATAURL_DIR, MEDIA_CACHE, ALT_CACHE]) {
   try { spawnSync("rm", ["-rf", d], { stdio: "pipe" }) } catch {}
 }
 console.log("[harness] Disk caches cleared")
+// Deterministic instance must exercise the OCR fallback, not the optional VLM.
+process.env.OCR_VLM_ENABLED = "0"
 
 // ---- 1. Ensure tesseract ----
 {
@@ -81,6 +83,7 @@ const defaultOpts = {
 const deterministicOpts = {
   ...defaultOpts,
   batchThreshold: 0,  // force deterministic always
+  extractorCache: false,
 }
 
 console.log(`[harness] Creating plugin instances`)

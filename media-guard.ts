@@ -24,12 +24,9 @@
 
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import { tmpdir } from "node:os"
-import { join, dirname } from "node:path"
-import { writeFileSync, statSync, readFileSync, realpathSync, mkdirSync, existsSync } from "node:fs"
+import { join, dirname, resolve } from "node:path"
+import { writeFileSync, statSync, readFileSync, mkdirSync, existsSync } from "node:fs"
 import { createHash } from "node:crypto"
-import { spawn } from "node:child_process"
-import { fileURLToPath } from "node:url"
-import { parse as parseYaml } from "yaml"
 
 type Options = {
   // mime patterns to intercept. "*" wildcard suffix supported (e.g. "audio/*").
@@ -45,16 +42,10 @@ type Options = {
   timeoutSec?: number
   // Media kinds routed to the cheap agent. Default ["image"].
   agentKinds?: string[]
-  // Model identifier for the cheap agent. Default: the ui-ux-designer agent's model from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
-  agentModel?: string
-  // Model variant for the cheap agent. Default: the ui-ux-designer agent's effort from config/agent-runtime/agent-config.yml (hardcoded fallback if unreachable).
-  agentVariant?: string
-  // Timeout (seconds) for cheap agent calls. Default 300.
-  agentTimeoutSec?: number
   // Bounded parallelism for the transform fan-out. Default 6.
   concurrency?: number
   // If a single transform has MORE than this many matched media parts,
-  // force deterministic local extraction (extract.py OCR) instead of per-image agent spawns. Default 24.
+  // force deterministic local extraction (extract.py OCR) instead of local vision. Default 24.
   batchThreshold?: number
   // Global wall-clock budget for the whole transform. Default 240.
   transformBudgetSec?: number
@@ -69,6 +60,14 @@ type Options = {
   // Ollama context window (num_ctx) for local vision. Default 16384.
   // Caps KV-cache memory; the model's max (262k) would balloon RAM to ~26GB.
   visionNumCtx?: number
+  visionCandidateEnabled?: boolean
+  visionCandidateModel?: string
+  evidencePath?: string
+  evidenceSha256?: string
+  // Optional local OCR correction. Disabled by default and evidence-gated.
+  ocrCorrection?: boolean
+  // Enable extractor's bounded disk cache. Enabled by default for deterministic results.
+  extractorCache?: boolean
 }
 
 const DEFAULT_MIMES = ["application/pdf", "audio/*", "video/*"]
@@ -76,6 +75,102 @@ const ZIP_MIMES = ["application/zip", "application/x-zip", "application/x-zip-co
 const MAX_ZIP_DEPTH = 2
 const EXTRACT = new URL("./media/extract.py", import.meta.url).pathname
 const DATAURL_DIR = join(tmpdir(), "opencode-media-guard-data")
+
+function verifiedEvidence(path?: string, expectedHash?: string, expectedCandidate?: string, expectedBaseline?: string): boolean {
+  if (!path || !expectedHash || !/^[a-f0-9]{64}$/i.test(expectedHash)) return false
+  try {
+    const bytes = readFileSync(path)
+    const actual = createHash("sha256").update(bytes).digest("hex")
+    if (actual.toLowerCase() !== expectedHash.toLowerCase()) return false
+    const artifact = JSON.parse(bytes.toString("utf8"))
+    const gates = artifact?.gates
+    const metrics = artifact?.metrics
+    if (!(artifact?.schema_version === 2 &&
+      artifact?.decision === "computed-from-validated-records" &&
+      typeof artifact?.manifest?.path === "string" &&
+      /^[a-f0-9]{64}$/i.test(artifact?.manifest?.sha256 ?? "") &&
+      typeof artifact?.candidate_model === "string" &&
+      typeof artifact?.baseline_model === "string" &&
+      artifact.candidate_model !== artifact.baseline_model &&
+      (!expectedCandidate || artifact.candidate_model === expectedCandidate) &&
+      (!expectedBaseline || artifact.baseline_model === expectedBaseline) &&
+      Array.isArray(artifact?.holdout) && artifact.holdout.length > 0 &&
+      typeof artifact?.ui_assertions?.path === "string" &&
+      /^[a-f0-9]{64}$/i.test(artifact?.ui_assertions?.sha256 ?? "") &&
+      artifact?.remote_fallback === false &&
+      gates?.schema === true && gates?.manifest_identity === true &&
+      gates?.provenance === true && gates?.holdout === true &&
+      gates?.remote_fallback === true && gates?.rss === true &&
+      gates?.safety === true &&
+      gates?.non_regression === true &&
+      artifact?.comparison?.pass === true &&
+      Number.isFinite(artifact?.comparison?.threshold) &&
+      Number.isFinite(metrics?.tesseract?.records) && metrics.tesseract.records > 0 &&
+      Number.isFinite(metrics?.production?.records) && metrics.production.records > 0 &&
+      artifact?.results?.path && /^[a-f0-9]{64}$/i.test(artifact?.results?.sha256 ?? ""))) return false
+
+    const base = dirname(path)
+    const manifestPath = resolve(base, artifact.manifest.path)
+    const resultsPath = resolve(base, artifact.results.path)
+    const manifestBytes = readFileSync(manifestPath)
+    if (createHash("sha256").update(manifestBytes).digest("hex") !== artifact.manifest.sha256) return false
+    const manifest = JSON.parse(manifestBytes.toString("utf8"))
+    if (manifest.schema_version !== 2 || manifest.provenance?.authorship !== "human" || manifest.provenance?.blinding !== "holdout" || !Array.isArray(manifest.holdout) || manifest.holdout.length === 0) return false
+    if (!artifact.ui_assertions || JSON.stringify(artifact.ui_assertions) !== JSON.stringify(manifest.ui_assertions)) return false
+    const uiPath = resolve(base, manifest.ui_assertions.path)
+    if (createHash("sha256").update(readFileSync(uiPath)).digest("hex") !== manifest.ui_assertions.sha256) return false
+    const ui = JSON.parse(readFileSync(uiPath).toString("utf8"))
+    if (ui.schema_version !== 1 || ui.synthetic_text !== true || ui.no_image_file_parts !== true || ui.local_transport !== true || ui.remote_fallback !== false) return false
+    const resultBytes = readFileSync(resultsPath)
+    if (createHash("sha256").update(resultBytes).digest("hex") !== artifact.results.sha256) return false
+    const samples = new Map((manifest.corpus ?? []).map((sample: any) => [sample.id, sample]))
+    const fixtureHashes = new Map<string, { id: string; split: string }>()
+    const oracleHashes = new Map<string, { id: string; split: string }>()
+    for (const sample of manifest.corpus ?? []) {
+      for (const [label, hash, seen] of [["fixture", sample.fixture?.sha256, fixtureHashes], ["oracle", sample.oracle?.sha256, oracleHashes]] as const) {
+        if (typeof hash !== "string") return false
+        const previous = seen.get(hash)
+        if (previous && previous.id !== sample.id && (previous.split !== sample.split || sample.split === "holdout")) return false
+        seen.set(hash, { id: sample.id, split: sample.split })
+      }
+    }
+    const records = resultBytes.toString("utf8").split("\n").filter(Boolean).map(JSON.parse)
+    if (!records.length || !records.some((r: any) => r.role === "apple") || !records.some((r: any) => r.role === "tesseract") || !records.some((r: any) => r.role === "production")) return false
+    for (const record of records) {
+      const sample = samples.get(record.sample_id)
+      const expectedModel = record.role === "production"
+        ? artifact.candidate_model
+        : record.role === "tesseract"
+          ? artifact.baseline_model
+          : record.role === "apple"
+            ? "extract.py:apple"
+            : null
+      if (record.schema_version !== 2 || record.split !== "benchmark" || !sample || sample.split !== "benchmark" || manifest.holdout.includes(record.sample_id) ||
+        !expectedModel || record.model !== expectedModel ||
+        sample.fixture?.path !== record.fixture?.path || sample.fixture?.sha256 !== record.fixture?.sha256 ||
+        sample.oracle?.path !== record.oracle?.path || sample.oracle?.sha256 !== record.oracle?.sha256 ||
+        typeof record.raw_output !== "string" || record.raw_output_sha256 !== createHash("sha256").update(record.raw_output).digest("hex") ||
+        record.errors?.some((error: unknown) => /timeout/i.test(String(error))) || record.timed_out === true ||
+        record.rss?.gate_pass !== true ||
+        (record.scores?.exact_value_safety ?? record.scores?.authoritative?.exact_value_safety) !== true ||
+        (record.scores?.span_safety ?? record.scores?.authoritative?.span_safety) !== true ||
+        record.scores?.ui_assertions?.pass !== true || record.provenance?.production_enabled === true) return false
+    }
+    const meanScore = (role: string) => {
+      const roleRecords = records.filter((record: any) => record.role === role)
+      const values = roleRecords.map((record: any) => Number(record.scores?.total ?? record.scores?.authoritative?.total))
+      return values.length > 0 && values.every(Number.isFinite)
+        ? values.reduce((sum: number, value: number) => sum + value, 0) / values.length
+        : NaN
+    }
+    const baselineScore = meanScore("tesseract")
+    const candidateScore = meanScore("production")
+    if (!Number.isFinite(baselineScore) || !Number.isFinite(candidateScore) || candidateScore < baselineScore * 0.95) return false
+    return true
+  } catch {
+    return false
+  }
+}
 
 // Map media kind -> the skill that handles the richer, non-extraction work.
 const SKILL_FOR: Record<string, string> = {
@@ -201,41 +296,20 @@ function videoPrompt(goal: string, transcript: string): string {
   return p
 }
 
-// The cheap-agent model/effort can be overridden via plugin opts (agentModel/
-// agentVariant). Otherwise, they default to the ui-ux-designer agent defined in the
-// single source of truth (config/agent-runtime/agent-config.yml) because it is vision-capable,
-// so a model/effort swap there propagates here without editing this plugin. Resolved via the
-// plugin's real path (opencode loads it through a symlink). Falls back to a
-// hardcoded gemini pair if the SOT is unreachable (e.g. plugin used outside dotfiles).
-const REAL_PLUGIN_PATH = (() => {
-  const p = fileURLToPath(import.meta.url)
-  try { return realpathSync(p) } catch { return p }
-})()
-const SOT_YAML = join(dirname(REAL_PLUGIN_PATH), "..", "..", "agent-runtime", "agent-config.yml")
-
-function resolveCheapAgent(): { model?: string; effort?: string } {
-  try {
-    const spec: any = parseYaml(readFileSync(SOT_YAML, "utf8"))
-    const agent = spec?.agents?.["ui-ux-designer"]
-    return { model: agent?.model, effort: agent?.effort }
-  } catch {
-    return {}
-  }
-}
-
 export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}) => {
   const emit = async (message: string, level: "debug"|"info"|"warn"|"error" = "info", extra?: Record<string, unknown>) => {
     try { await client?.app?.log({ body: { service: "media-guard", level, message, ...(extra ? { extra } : {}) } }) } catch {}
   }
 
   const agentKinds = new Set(opts.agentKinds ?? ["image"])
-  const cheapAgent = resolveCheapAgent()
-  const agentModel = opts.agentModel ?? cheapAgent.model ?? "github-copilot/gemini-3.5-flash"
-  const agentVariant = opts.agentVariant ?? cheapAgent.effort ?? "medium"
-  const agentTimeoutMs = (opts.agentTimeoutSec ?? 300) * 1000
-
+  const configuredBaselineModel = opts.visionModel ?? "gemma4:12b"
+  const configuredCandidateModel = opts.visionCandidateModel ?? "qwen2.5vl:7b"
+  const evidenceVerified = verifiedEvidence(opts.evidencePath, opts.evidenceSha256, configuredCandidateModel, configuredBaselineModel)
+  const candidateEnabled = opts.visionCandidateEnabled === true && evidenceVerified
   const visionEnabled = opts.visionEnabled !== false
-  const visionModel = opts.visionModel ?? "gemma4:12b"
+  const visionModel = candidateEnabled
+    ? configuredCandidateModel
+    : configuredBaselineModel
   const visionBaseUrl = (opts.visionBaseUrl ?? "http://127.0.0.1:11434").replace(/\/+$/, "")
   const visionNumCtx = opts.visionNumCtx ?? 16384
   const visionTimeoutMs = (opts.visionTimeoutSec ?? 120) * 1000
@@ -265,6 +339,8 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
   const concurrency = Math.max(1, opts.concurrency ?? 6)
   const batchThreshold = opts.batchThreshold ?? 24
   const transformBudgetMs = (opts.transformBudgetSec ?? 240) * 1000
+  const ocrCorrection = opts.ocrCorrection === true && evidenceVerified
+  const extractorCache = opts.extractorCache !== false
 
   // in-memory result cache: path+mtime+size -> note text
   const cache = new Map<string, string>()
@@ -311,8 +387,15 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
   }
 
   // Call extract.py; returns parsed JSON or null on hard failure.
-  const runExtract = async (path: string, mime: string, max: number): Promise<any | null> => {
-    const r = await $`python3 ${EXTRACT} ${path} --mime ${mime} --max-chars ${max} --timeout ${timeoutSec} --model ${model}`
+  const runExtract = async (path: string, mime: string, max: number, ocrEngine?: string, classifyOnly = false, deadline = Infinity): Promise<any | null> => {
+    if (Number.isFinite(deadline) && Date.now() >= deadline) return null
+    const remainingSec = Number.isFinite(deadline) ? (deadline - Date.now()) / 1000 : timeoutSec
+    const args = ["python3", EXTRACT, path, "--mime", mime, "--max-chars", String(max), "--timeout", String(Math.min(timeoutSec, remainingSec)), "--model", model]
+    if (ocrEngine) args.push("--ocr-engine", ocrEngine)
+    if (classifyOnly) args.push("--classify-only")
+    if (ocrCorrection) args.push("--ocr-correction")
+    if (!extractorCache) args.push("--no-cache")
+    const r = await $`${args}`
       .quiet().nothrow()
     const out = String(r.stdout).trim()
     if (!out) return null
@@ -341,69 +424,6 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
     } catch {
       return null
     }
-  }
-
-  const runAgent = (paths: string[], promptText: string): Promise<string | null> => {
-    return new Promise((resolve) => {
-      const clean = (s: string) => s.replace(/\0/g, "")
-      let resolved = false
-      const args = [
-        "run",
-        clean(promptText),
-        "--pure",
-        "-m",
-        clean(agentModel),
-        "--variant",
-        clean(agentVariant)
-      ]
-      for (const p of paths) {
-        args.push("-f", clean(p))
-      }
-
-      try {
-        const child = spawn("opencode", args, {
-          stdio: ["ignore", "pipe", "ignore"]
-        })
-
-        let stdout = ""
-        child.stdout.on("data", (chunk) => {
-          stdout += chunk.toString()
-        })
-
-        const timer = setTimeout(() => {
-          if (!resolved) {
-            resolved = true
-            child.kill("SIGKILL")
-            resolve(null)
-          }
-        }, agentTimeoutMs)
-
-        child.on("error", () => {
-          if (!resolved) {
-            resolved = true
-            clearTimeout(timer)
-            resolve(null)
-          }
-        })
-
-        child.on("exit", (code) => {
-          if (!resolved) {
-            resolved = true
-            clearTimeout(timer)
-            if (code === 0) {
-              resolve(stdout)
-            } else {
-              resolve(null)
-            }
-          }
-        })
-      } catch {
-        if (!resolved) {
-          resolved = true
-          resolve(null)
-        }
-      }
-    })
   }
 
   const runLocalVision = async (paths: string[], promptText: string): Promise<string | null> => {
@@ -435,19 +455,19 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
       })
       clearTimeout(timer)
       if (!resp.ok) {
-        if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to remote agent)")
+        if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to deterministic local extraction)")
         return null
       }
       const json: any = await resp.json()
       const content: string | undefined = json?.message?.content
       if (!content) {
-        if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to remote agent)")
+        if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to deterministic local extraction)")
         return null
       }
       if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] ok model=" + visionModel + " images=" + images.length)
       return content
     } catch {
-      if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to remote agent)")
+      if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard:vision] miss (fallback to deterministic local extraction)")
       return null
     }
   }
@@ -459,9 +479,12 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
           `content use the media_extract tool or load the \`${SKILL_FOR[kind] ?? "relevant"}\` skill on ${path}.]`
         : ""
       const via = res.tool ? ` via ${res.tool}` : ""
+      const original = typeof res.original_text === "string" ? res.original_text : res.text
+      const corrected = typeof res.corrected_text === "string" ? res.corrected_text : null
+      const alternative = corrected ? `\n\n----- BEGIN CORRECTED ALTERNATIVE (NOT AUTHORITATIVE) -----\n${corrected}\n----- END CORRECTED ALTERNATIVE -----` : ""
       return `${header}\nIts extracted text is inlined below${via}.\nFile: ${path}\n\n` +
-        `----- BEGIN EXTRACTED ${kind.toUpperCase()} TEXT -----\n${res.text}` +
-        `\n----- END EXTRACTED ${kind.toUpperCase()} TEXT -----${trunc}`
+        `----- BEGIN AUTHORITATIVE ORIGINAL ${kind.toUpperCase()} OCR/TEXT -----\n${original}` +
+        `\n----- END AUTHORITATIVE ORIGINAL ${kind.toUpperCase()} OCR/TEXT -----${alternative}${trunc}`
     } else {
       const why = res?.detail ? ` (${res.detail})` : ""
       return `${header}\nLocal extraction was unavailable${why}. ${skillHint(kind)} ` +
@@ -474,7 +497,7 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
   // ctl.deadline — wall-clock expiry; if exceeded (after cache check) return a fast pointer note.
   // ctl.counters — optional debug counters incremented at each return path.
   // ctl.sink — optional sink to tag which path handled the file.
-  const buildNote = async (part: any, mime: string, userGoal: string, ctl: { forceDeterministic: boolean; deadline: number; counters?: { agent: number; deterministic: number; pointer: number; error: number }; sink?: { via?: string }; depth?: number } = { forceDeterministic: false, deadline: Infinity }): Promise<string> => {
+  const buildNote = async (part: any, mime: string, userGoal: string, ctl: { forceDeterministic: boolean; deadline: number; fileDeadline?: number; counters?: { agent: number; deterministic: number; pointer: number; error: number }; sink?: { via?: string }; depth?: number } = { forceDeterministic: false, deadline: Infinity }): Promise<string> => {
     const kind = kindForMime(mime)
     const path = resolvePath(part)
     const label = part?.filename || path || part?.url || "attachment"
@@ -497,13 +520,15 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
     let ckey = path
     try { const st = statSync(path); ckey = `${path}:${st.mtimeMs}:${st.size}:${maxChars}:${model}:${mime}` } catch {}
     if (viaAgent) {
-      ckey += `:${agentModel}:${agentVariant}:${hashStr(userGoal)}`
+      ckey += `:${visionModel}:${hashStr(userGoal)}`
     }
     const hit = cache.get(ckey)
     if (hit) return hit
 
+    const fileDeadline = ctl.fileDeadline ?? ctl.deadline
+
     // deadline guard — cached results always return; fresh work honours budget
-    if (Date.now() > ctl.deadline) {
+    if (Date.now() >= fileDeadline) {
       if (ctl.counters) ctl.counters.pointer++
       win("skipped-budget")
       return `${initialHeader}\nThe per-turn media budget was exhausted before this file could be processed, so it was NOT sent to the model. ${skillHint(kind)} File: ${path}`
@@ -545,7 +570,7 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
         const childSink: { via?: string } = {}
         let note: string
         try {
-          note = await buildNote(childPart, childMime, userGoal, { forceDeterministic: ctl.forceDeterministic, deadline: ctl.deadline, counters: ctl.counters, sink: childSink, depth: depth + 1 })
+         note = await buildNote(childPart, childMime, userGoal, { forceDeterministic: ctl.forceDeterministic, deadline: ctl.deadline, fileDeadline, counters: ctl.counters, sink: childSink, depth: depth + 1 })
         } catch (e) {
           note = `[media-guard] Zip entry "${childName}" could not be processed (${e instanceof Error ? e.message : String(e)}).`
         }
@@ -558,24 +583,29 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
 
     // IMAGE agent branch (gated by forceDeterministic)
     if (kind === "image" && agentKinds.has("image") && !ctl.forceDeterministic && path) {
-      const prompt = imagePrompt(userGoal)
-      let digest = visionEnabled ? await runLocalVision([path], prompt) : null
-      let viaLocal = digest !== null
-      if (digest === null) {
-        digest = await runAgent([path], prompt)
-      }
-      const json = digest ? extractJson(digest) : null
-      if (json !== null) {
-        if (ctl.counters) ctl.counters.agent++
-        const suffix = viaLocal ? " (local vision)" : ""
-        const header = `[media-guard] An image ("${label}") was distilled to a JSON digest by a cheaper model instead of being sent as raw bytes (byte-exact values preserved in key_metadata).${suffix}`
+       const classification = await runExtract(path, mime, maxChars, undefined, true, fileDeadline)
+       const isDocument = classification?.meta?.document_image === true
+       if (isDocument) {
+         const fallbackHeader = `[media-guard] A detected document image ("${label}") was OCR'd locally before model processing; raw image bytes were not sent.`
+         const res = await runExtract(path, mime, maxChars, "production", false, fileDeadline)
+         if (ctl.counters) ctl.counters.deterministic++
+         const note = extractNote(res, kind, path, fallbackHeader)
+         win("ocr-document")
+         return cacheSetAndEvict(ckey, note)
+       }
+        const prompt = imagePrompt(userGoal)
+       let digest = visionEnabled ? await runLocalVision([path], prompt) : null
+       const json = digest ? extractJson(digest) : null
+       if (json !== null) {
+         if (ctl.counters) ctl.counters.agent++
+         const header = `[media-guard] An image ("${label}") was distilled to a JSON digest by a cheaper model instead of being sent as raw bytes (byte-exact values preserved in key_metadata). (local vision)`
         const note = header + `\nDownstream Agent: Use the exact 'File: ${path}' path to read/reference this file or get the text directly from the 'full_text' field inside the JSON digest below. DO NOT attempt to run any re-OCR on the image and do not report that you cannot locate or see the image.\nFile: ${path}\n\n----- BEGIN MEDIA DIGEST (JSON) -----\n${json}\n----- END MEDIA DIGEST (JSON) -----`
-        win(viaLocal ? "local-vision" : "remote-agent")
+        win("local-vision")
         return cacheSetAndEvict(ckey, note)
       }
       // On failure fall through to deterministic OCR
       const fallbackHeader = `[media-guard] A ${kind} file ("${label}") was attached but NOT sent to the model — this provider rejects ${mime} file parts (sending it would break the turn).`
-      const res = await runExtract(path, mime, maxChars)
+       const res = await runExtract(path, mime, maxChars, "tesseract", false, fileDeadline)
       if (ctl.counters) ctl.counters.deterministic++
       const note = extractNote(res, kind, path, fallbackHeader)
       win("ocr")
@@ -584,24 +614,19 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
 
     // VIDEO branch (gated by forceDeterministic)
     if (kind === "video" && agentKinds.has("video") && !ctl.forceDeterministic && path) {
-      const res = await runExtract(path, mime, maxChars) // frames + transcript
+       const res = await runExtract(path, mime, maxChars, undefined, false, fileDeadline) // frames + transcript
       const frames = Array.isArray(res?.meta?.frames) ? res.meta.frames : []
       const transcript = (res?.text || "")
       if (frames.length) {
-        const useFrames = frames.slice(0, MAX_AGENT_FRAMES)
-        const prompt = videoPrompt(userGoal, transcript)
-        let digest = visionEnabled ? await runLocalVision(useFrames, prompt) : null
-        let viaLocal = digest !== null
-        if (digest === null) {
-          digest = await runAgent(useFrames, prompt)
-        }
-        const json = digest ? extractJson(digest) : null
-        if (json !== null) {
-          if (ctl.counters) ctl.counters.agent++
-          const suffix = viaLocal ? " (local vision)" : ""
-          const header = `[media-guard] A video ("${label}") was distilled by a cheaper multimodal model — ${frames.length} scene-sampled keyframes fused with its audio transcript — instead of being sent as raw bytes. Full transcript, frames, and the original video remain on disk.${suffix}`
+         const useFrames = frames.slice(0, MAX_AGENT_FRAMES)
+         const prompt = videoPrompt(userGoal, transcript)
+         let digest = visionEnabled ? await runLocalVision(useFrames, prompt) : null
+         const json = digest ? extractJson(digest) : null
+         if (json !== null) {
+           if (ctl.counters) ctl.counters.agent++
+           const header = `[media-guard] A video ("${label}") was distilled by a cheaper multimodal model — ${frames.length} scene-sampled keyframes fused with its audio transcript — instead of being sent as raw bytes. Full transcript, frames, and the original video remain on disk. (local vision)`
           const note = header + `\nUse the media_extract tool on the File path for the COMPLETE transcript, or read individual frames.\nFile: ${path}\nFrames dir: ${dirname(useFrames[0])}\n\n----- BEGIN VIDEO DIGEST (JSON) -----\n${json}\n----- END VIDEO DIGEST (JSON) -----`
-          win(viaLocal ? "local-vision" : "remote-agent")
+          win("local-vision")
           return cacheSetAndEvict(ckey, note)
         }
       }
@@ -615,7 +640,7 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
 
     // Otherwise (pdf / audio / non-agent kinds / forced-deterministic image or video)
     const fallbackHeader = `[media-guard] A ${kind} file ("${label}") was attached but NOT sent to the model — this provider rejects ${mime} file parts (sending it would break the turn).`
-    const res = await runExtract(path, mime, maxChars)
+     const res = await runExtract(path, mime, maxChars, undefined, false, fileDeadline)
     if (ctl.counters) ctl.counters.deterministic++
     const note = extractNote(res, kind, path, fallbackHeader)
     win("extract")
@@ -639,7 +664,8 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
       const sink: { via?: string } = {}
       let text: string
       try {
-        text = await buildNote(m.part, m.mime, userGoal, { forceDeterministic, deadline, counters, sink })
+        const fileDeadline = Math.min(deadline, Date.now() + timeoutSec * 1000)
+        text = await buildNote(m.part, m.mime, userGoal, { forceDeterministic, deadline, fileDeadline, counters, sink })
       } catch (e) {
         counters.error++
         text = `[media-guard] A media file ("${label}", ${m.mime}) was attached but its content could not be processed (${e instanceof Error ? e.message : String(e)}). It was NOT sent to the model, to avoid leaking raw bytes or breaking the turn. If you need its content, use the media_extract tool on its local path.`
@@ -649,8 +675,9 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
         m.parts[m.index] = { id: m.part.id, sessionID: m.part.sessionID, messageID: m.part.messageID, type: "text", text, synthetic: true }
       } catch (e) { console.error("[media-guard] failed to swap media part:", e) }
     })
-    await emit(`media distillation complete in ${Date.now() - start}ms`, "info", { ...counters })
-    return { forceDeterministic, elapsedMs: Date.now() - start }
+    const elapsedMs = Date.now() - start
+    await emit(`media distillation complete in ${elapsedMs}ms`, "info", { ...counters })
+    return { forceDeterministic, elapsedMs }
   }
 
   return {
@@ -727,7 +754,6 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
         try { msg.parts = msg.parts } catch (e) { console.error("[media-guard] failed to assign parts:", e) }
       }
 
-      // Phase 4: Debug telemetry
       if (process.env.MEDIA_GUARD_DEBUG) {
         console.error("[media-guard] " + JSON.stringify({
           matches: matches.length,
@@ -742,6 +768,7 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
           error: counters.error,
         }))
       }
+
     },
 
     tool: {
@@ -762,7 +789,10 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
             .describe("Whisper model for audio/video (tiny|base|small|medium|large). Default base."),
         },
         async execute({ path, mime, maxChars: mc, model: md }) {
-          const r = await $`python3 ${EXTRACT} ${path} --mime ${mime ?? ""} --max-chars ${mc} --timeout ${Math.max(timeoutSec, 600)} --model ${md ?? model}`
+          const args = ["python3", EXTRACT, path, "--mime", mime ?? "", "--max-chars", String(mc), "--timeout", String(Math.max(timeoutSec, 600)), "--model", md ?? model, "--ocr-engine", "production"]
+          if (ocrCorrection) args.push("--ocr-correction")
+          if (!extractorCache) args.push("--no-cache")
+          const r = await $`${args}`
             .quiet().nothrow()
           const out = String(r.stdout).trim()
           if (!out) return "media_extract failed: no output from extractor."
@@ -770,7 +800,10 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
           try { res = JSON.parse(out) } catch { return "media_extract failed to parse output:\n" + out.slice(0, 500) }
           if (res.status === "ok") {
             const t = res.truncated ? `\n[truncated to ${mc} of ${res.full_chars} chars]` : ""
-            return `kind=${res.kind} tool=${res.tool} chars=${res.chars}${t}\n\n${res.text}`
+            const original = typeof res.original_text === "string" ? res.original_text : res.text
+            const corrected = typeof res.corrected_text === "string" ? res.corrected_text : null
+            const alternative = corrected ? `\n\n----- CORRECTED ALTERNATIVE (NOT AUTHORITATIVE) -----\n${corrected}\n----- END CORRECTED ALTERNATIVE -----` : ""
+            return `kind=${res.kind} tool=${res.tool} chars=${res.chars}${t}\n\n----- AUTHORITATIVE ORIGINAL OCR/TEXT -----\n${original}\n----- END AUTHORITATIVE ORIGINAL OCR/TEXT -----${alternative}`
           }
           return `media_extract status=${res.status}: ${res.detail ?? "unavailable"}`
         },

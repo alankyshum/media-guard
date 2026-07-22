@@ -19,6 +19,7 @@ import { spawnSync } from "node:child_process"
 const TEST_DIR = import.meta.dir
 const PLUGIN_FILE = join(TEST_DIR, "..", "media-guard.ts")
 const GEN_SCRIPT = join(TEST_DIR, "gen_images.py")
+process.env.OCR_VLM_ENABLED = "0"
 
 // ---- 1. Ensure tesseract is available ----
 {
@@ -69,6 +70,7 @@ const opts = {
   concurrency: 6,
   batchThreshold: 24,
   transformBudgetSec: 240,
+  extractorCache: false,
 }
 
 console.log(`[harness] Creating plugin instance`)

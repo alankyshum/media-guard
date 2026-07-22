@@ -5,6 +5,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source_hash="$(shasum -a 256 "$SCRIPT_DIR/apple-vision-ocr.swift" | cut -d ' ' -f 1)"
+cache_root="${MEDIA_GUARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/Library/Caches}/opencode/media-guard}"
+apple_vision_bin="$cache_root/apple-vision-ocr-$source_hash"
 py="$(command -v python3 || true)"
 echo "media-guard extractor — backend check"
 echo "python3: ${py:-MISSING}"
@@ -35,6 +38,18 @@ check_cli ffmpeg  "brew install ffmpeg   (whisper needs it to decode media)"
 
 echo "Image OCR backend:"
 check_cli tesseract "brew install tesseract"
+if [ "$(uname -s)" = "Darwin" ] && command -v swiftc >/dev/null 2>&1; then
+  echo "  [ok]   Apple Vision bridge compiler (swiftc)"
+  if [ -x "$apple_vision_bin" ]; then
+    echo "  [ok]   Apple Vision OCR bridge ($apple_vision_bin)"
+  elif mkdir -p "$cache_root" && swiftc "$SCRIPT_DIR/apple-vision-ocr.swift" -framework Vision -framework ImageIO -o "$apple_vision_bin"; then
+    echo "  [ok]   Apple Vision OCR bridge ($apple_vision_bin)"
+  else
+    echo "  [MISS] Apple Vision OCR bridge — compile failed; tesseract remains authoritative"
+  fi
+else
+  echo "  [MISS] Apple Vision bridge — macOS swiftc unavailable; tesseract remains authoritative"
+fi
 
 echo "VLM OCR backend (preferred image + scanned-PDF OCR):"
 ocr_vlm_base_url="${OCR_VLM_BASE_URL:-http://127.0.0.1:11434}"

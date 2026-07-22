@@ -5,7 +5,7 @@
  * Asserts:
  *   (a) image file part converted to synthetic text part, zero file parts remain
  *   (b) the resulting text contains a JSON digest with "MEDIAGUARD OCR TOKEN 0001"
- *   (c) stderr contains "[media-guard:vision] ok" and NO "opencode run" subprocess
+ *   (c) digest carries the local-vision marker
  *   (d) 2nd call on fresh output is much faster (in-memory cache)
  *
  * Usage: rm -rf "${TMPDIR:-/tmp}/opencode-media-cache" /tmp/opencode-media-cache
@@ -19,6 +19,9 @@ import { mkdtempSync, readFileSync, readdirSync, existsSync, statSync } from "no
 import { spawnSync } from "node:child_process"
 
 const TEST_DIR = import.meta.dir
+const SELECTED_MODEL = process.env.MEDIA_GUARD_SELECTED_MODEL || "qwen2.5vl:7b"
+const CURRENT_MODEL = process.env.MEDIA_GUARD_CURRENT_MODEL || SELECTED_MODEL
+const BASELINE_MODEL = process.env.MEDIA_GUARD_BASELINE_MODEL || "gemma4:12b"
 const PLUGIN_FILE = join(TEST_DIR, "..", "media-guard.ts")
 const GEN_SCRIPT = join(TEST_DIR, "gen_images.py")
 
@@ -30,16 +33,16 @@ try {
   const r = await fetch("http://127.0.0.1:11434/api/tags")
   if (r.ok) {
     const data = await r.json()
-    hasVisionModel = (data.models || []).some((m) => m.name === "qwen2.5vl:7b")
+    hasVisionModel = (data.models || []).some((m) => m.name === CURRENT_MODEL)
     ollamaUp = true
-    console.log(`[harness] ollama at 127.0.0.1:11434 — qwen2.5vl:7b present: ${hasVisionModel}`)
+    console.log(`[harness] ollama at 127.0.0.1:11434 — expected=${SELECTED_MODEL} current=${CURRENT_MODEL} baseline=${BASELINE_MODEL} current present: ${hasVisionModel}`)
   }
 } catch (e) {
   console.log(`[harness] ollama not reachable: ${e}`)
 }
 if (!ollamaUp || !hasVisionModel) {
-  console.log("[harness] SKIP — ollama or qwen2.5vl:7b not available; can't test local vision path.")
-  console.log("[harness] (This is non-fatal; the plugin falls back to remote agent gracefully.)")
+  console.log(`[harness] SKIP — ollama or ${SELECTED_MODEL} not available; can't test local vision path.`)
+    console.log("[harness] (This is non-fatal; the plugin falls back to deterministic local extraction.)")
   process.exit(0)
 }
 console.log("[harness] ollama vision model confirmed.")
@@ -87,7 +90,7 @@ const MediaGuardPlugin = mod.MediaGuardPlugin || mod.default
 
 const opts = {
   visionEnabled: true,
-  visionModel: "qwen2.5vl:7b",
+  visionModel: CURRENT_MODEL,
   visionBaseUrl: "http://127.0.0.1:11434",
   visionTimeoutSec: 120,
   agentKinds: ["image", "video"],
@@ -100,21 +103,19 @@ const opts = {
   transformBudgetSec: 240,
 }
 
-console.log(`[harness] Creating plugin instance (vision enabled)`)
 process.env.MEDIA_GUARD_DEBUG = "1"
-
-// Capture stderr lines to look for [media-guard:vision] telemetry
 const stderrLines = []
-const origStderrWrite = process.stderr.write.bind(process.stderr)
-process.stderr.write = (chunk, ...args) => {
-  const s = typeof chunk === "string" ? chunk : chunk.toString()
-  stderrLines.push(s)
-  return origStderrWrite(chunk, ...args)
+const origConsoleError = console.error
+console.error = (...args) => {
+  stderrLines.push(args.map(String).join(" "))
+  origConsoleError(...args)
 }
 
+console.log(`[harness] Creating plugin instance (vision enabled)`)
 const hooks = await MediaGuardPlugin({ $ }, opts)
 const chatMessage = hooks["chat.message"]
 if (typeof chatMessage !== "function") throw new Error("chat.message hook not found")
+if (BASELINE_MODEL === SELECTED_MODEL || BASELINE_MODEL === CURRENT_MODEL) throw new Error("expected/current and baseline models must differ")
 
 // ---- 5. Build test output ----
 function buildOutput() {
@@ -128,14 +129,12 @@ function buildOutput() {
 }
 
 // ---- 6. Run #1 (cold, local vision) ----
-stderrLines.length = 0
 const output1 = buildOutput()
+stderrLines.length = 0
 const t1 = Date.now()
 await chatMessage({ sessionID: "s", messageID: "msg_v" }, output1)
 const ms1 = Date.now() - t1
-
-// Restore stderr
-process.stderr.write = origStderrWrite
+console.error = origConsoleError
 
 const parts1 = output1.parts
 
@@ -166,24 +165,12 @@ if (hasDigestHeader) {
 const checkB = hasToken && parsedOk
 
 // (c) local vision path used — the digest header contains "(local vision)" suffix.
-// The (local vision) text is only added by the local-vision path; remote agent path
-// does NOT add it. Also confirm no deterministic fallback (agent counter=1 via debug telemetry).
+// The (local vision) text is only added by the local-vision path.
 const hasLocalSuffix = digestText.includes("(local vision)")
-// Check the debug line from stderr output for agent counter
-// (we can see it printed to stderr even if capture failed)
-const hasVisionOk = stderrLines.some(l => l.includes("[media-guard:vision] ok"))
-let agentCount = 0
-let deterministicCount = 0
-for (const l of stderrLines) {
-  if (l.includes("[media-guard:chat.message]")) {
-    try {
-      const m = l.match(/\{.*\}/)
-      if (m) { const d = JSON.parse(m[0]); agentCount = d.agent || 0; deterministicCount = d.deterministic || 0 }
-    } catch {}
-  }
-}
-// Also check the digest header says (local vision)
 const checkC = hasLocalSuffix
+const hasLocalTransport = stderrLines.some(line => line.includes("[media-guard:vision] ok"))
+const hasRemoteFallback = stderrLines.some(line => line.includes("[media-guard:vision] miss") || line.includes("opencode run"))
+const checkD = hasLocalTransport && !hasRemoteFallback
 
 console.log(`\n=== Run #1 (local vision, cold) ===`)
 console.log(`  Duration: ${ms1}ms`)
@@ -193,7 +180,7 @@ console.log(`  (b) has JSON digest header: ${hasDigestHeader ? "PASS" : "FAIL"}`
 console.log(`  (b) JSON parsed OK: ${parsedOk ? "PASS" : "FAIL"}`)
 console.log(`  (b) contains MEDIAGUARD OCR TOKEN 0001: ${hasToken ? "PASS" : "FAIL"}`)
 console.log(`  (c) local vision suffix: ${checkC ? "PASS" : "FAIL"}`)
-console.log(`  (c) agent count=${agentCount} deterministic=${deterministicCount}`)
+console.log(`  (c) local transport/no fallback: ${checkD ? "PASS" : "FAIL"}`)
 if (digestText) {
   console.log(`\n  Digest text (first 500 chars):`)
   console.log(`  ---`)
@@ -225,13 +212,14 @@ console.log(`  (d) ms1=${ms1}ms  ms2=${ms2}ms  ratio: ${(ms1 / Math.max(ms2, 1))
 console.log(`  (d) cache speedup (ms2 < ms1/2): ${cacheSpeedup ? "PASS" : "FAIL"}`)
 
 // ---- 8. Final PASS/FAIL ----
-const pass = checkA_type && checkA_noFile && checkB && checkC && cacheSpeedup
+const pass = checkA_type && checkA_noFile && checkB && checkC && checkD && cacheSpeedup
 
 console.log(`\n========================================`)
 console.log(`Run #1: ${ms1}ms (vision cold) | Run #2: ${ms2}ms (cache)`)
 console.log(`(a) synthetic+no-file: ${checkA_type && checkA_noFile ? "PASS" : "FAIL"}`)
 console.log(`(b) OCR token in digest: ${checkB ? "PASS" : "FAIL"}`)
 console.log(`(c) local vision suffix: ${checkC ? "PASS" : "FAIL"}`)
+console.log(`(c) local transport/no fallback: ${checkD ? "PASS" : "FAIL"}`)
 console.log(`(d) cache speedup: ${cacheSpeedup ? "PASS" : "FAIL"}`)
 console.log(`Final: ${pass ? "PASS" : "FAIL"}`)
 console.log(`========================================\n`)
