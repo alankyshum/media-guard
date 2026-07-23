@@ -26,7 +26,7 @@ import { tool, type Plugin } from "@opencode-ai/plugin"
 import { tmpdir } from "node:os"
 import { join, dirname, resolve } from "node:path"
 import { writeFileSync, statSync, readFileSync, mkdirSync, existsSync } from "node:fs"
-import { createHash } from "node:crypto"
+import { createHash, createPublicKey, verify as verifySignature } from "node:crypto"
 
 type Options = {
   // mime patterns to intercept. "*" wildcard suffix supported (e.g. "audio/*").
@@ -64,10 +64,103 @@ type Options = {
   visionCandidateModel?: string
   evidencePath?: string
   evidenceSha256?: string
+  holdoutEvaluationPath?: string
+  holdoutEvaluationSha256?: string
+  trustedAttestationKeys?: Record<string, string>
+  revokedAttestationKeys?: string[]
+  configSha256?: string
   // Optional local OCR correction. Disabled by default and evidence-gated.
   ocrCorrection?: boolean
   // Enable extractor's bounded disk cache. Enabled by default for deterministic results.
   extractorCache?: boolean
+}
+
+type Admission = { evidence: boolean; stickyNotes: boolean }
+
+const FROZEN_SCORER = {
+  schema_version: 1,
+  scorer_version: "media-guard-score-v1",
+  thresholds: { total: 0.8, non_regression: 0.95 },
+  semantics: "oracle.notes text tokens are case-folded Unicode words; every token must occur in serialized output; every output note must contain box or bbox array; total is mean(exact_value_safety, span_safety)",
+} as const
+
+function canonical(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`
+  return `{${Object.keys(value as Record<string, unknown>).sort().map(key => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}`
+}
+
+function sha256(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex")
+}
+
+function publicKeyBytes(value: string): Buffer {
+  if (value.includes("BEGIN PUBLIC KEY")) return createPublicKey(value).export({ type: "spki", format: "der" }) as Buffer
+  return Buffer.from(value, "base64")
+}
+
+function scoreFromBoundRecord(record: any, oracleBytes: Buffer): { total: number; exact_value_safety: boolean; span_safety: boolean } | null {
+  if (!record || typeof record.raw_output !== "string" || !record.raw_output_sha256 || sha256(record.raw_output) !== record.raw_output_sha256) return null
+  if (!record.oracle?.sha256 || sha256(oracleBytes) !== String(record.oracle.sha256).toLowerCase()) return null
+  try {
+    const output = JSON.parse(record.raw_output)
+    const oracle = JSON.parse(oracleBytes.toString("utf8"))
+    const expected = Array.isArray(oracle.notes) ? oracle.notes : Array.isArray(oracle) ? oracle : null
+    const actual = Array.isArray(output.notes) ? output.notes : Array.isArray(output.detections) ? output.detections : null
+    if (!expected || !actual) return null
+    const expectedTokens = expected.flatMap((note: any) => String(note?.text ?? note?.content ?? "").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
+    const actualText = JSON.stringify(actual).toLowerCase()
+    const exact = expectedTokens.length > 0 && expectedTokens.every((token: string) => actualText.includes(token))
+    const span = actual.every((note: any) => Array.isArray(note?.box ?? note?.bbox))
+    const total = (Number(exact) + Number(span)) / 2
+    return { total, exact_value_safety: exact, span_safety: span }
+  } catch {
+    return null
+  }
+}
+
+function recomputedScore(record: any, base: string): { total: number; exact_value_safety: boolean; span_safety: boolean } | null {
+  try {
+    const oraclePath = resolve(base, String(record.oracle.path))
+    const oracleBytes = readFileSync(oraclePath)
+    if (sha256(oracleBytes) !== String(record.oracle.sha256).toLowerCase()) return null
+    return scoreFromBoundRecord(record, oracleBytes)
+  } catch {
+    return null
+  }
+}
+
+function verifyAttestation(artifact: any, evidenceHash: string, candidate: string, baseline: string, configHash: string, scorerHash: string, opts: Options): boolean {
+  const reject = (reason: string) => {
+    if (process.env.MEDIA_GUARD_DEBUG) console.error("[media-guard] attestation reject:", reason)
+    return false
+  }
+  const attestation = artifact?.attestation
+  if (!attestation || attestation.schema_version !== 1 || attestation.algorithm !== "Ed25519" || typeof attestation.key_id !== "string" || typeof attestation.signature !== "string") return reject("shape")
+  const trusted = opts.trustedAttestationKeys?.[attestation.key_id]
+   if (!trusted || (opts.revokedAttestationKeys ?? []).includes(attestation.key_id)) return reject("trust")
+  const now = Date.now()
+  const issued = Date.parse(String(attestation.issued_at))
+  const expires = Date.parse(String(attestation.expires_at))
+   if (!Number.isFinite(issued) || !Number.isFinite(expires) || issued > now || expires <= now) return reject("time")
+   if (attestation.candidate_model !== candidate || attestation.baseline_model !== baseline) return reject("models")
+  const unsignedArtifact = { ...artifact }
+  delete unsignedArtifact.attestation
+   if (attestation.evidence_sha256 !== sha256(canonical(unsignedArtifact))) return reject("evidence binding")
+   if (!/^[a-f0-9]{64}$/i.test(evidenceHash)) return reject("evidence hash")
+   if (!opts.configSha256 || configHash !== opts.configSha256 || attestation.config_sha256 !== opts.configSha256) return reject("config")
+   if (attestation.scorer_sha256 !== scorerHash) return reject(`scorer ${attestation.scorer_sha256} != ${scorerHash}`)
+   if (!Array.isArray(attestation.capabilities) || attestation.capabilities.some((cap: unknown) => typeof cap !== "string")) return reject("capabilities")
+   if ("previous_hash" in attestation || "sequence" in attestation) return reject("chain fields")
+  const signed = { ...attestation }
+  delete signed.signature
+  try {
+    const key = publicKeyBytes(trusted)
+    const signature = Buffer.from(attestation.signature, "base64")
+     return signature.length === 64 && verifySignature(null, Buffer.from(canonical(signed)), { key, format: "der", type: "spki" }, signature) || reject("signature")
+  } catch {
+    return false
+  }
 }
 
 const DEFAULT_MIMES = ["application/pdf", "audio/*", "video/*"]
@@ -76,12 +169,13 @@ const MAX_ZIP_DEPTH = 2
 const EXTRACT = new URL("./media/extract.py", import.meta.url).pathname
 const DATAURL_DIR = join(tmpdir(), "opencode-media-guard-data")
 
-function verifiedEvidence(path?: string, expectedHash?: string, expectedCandidate?: string, expectedBaseline?: string): boolean {
-  if (!path || !expectedHash || !/^[a-f0-9]{64}$/i.test(expectedHash)) return false
+function verifiedEvidence(path?: string, expectedHash?: string, expectedCandidate?: string, expectedBaseline?: string, opts: Options = {}): Admission {
+  const rejected: Admission = { evidence: false, stickyNotes: false }
+  if (!path || !expectedHash || !/^[a-f0-9]{64}$/i.test(expectedHash)) return rejected
   try {
     const bytes = readFileSync(path)
     const actual = createHash("sha256").update(bytes).digest("hex")
-    if (actual.toLowerCase() !== expectedHash.toLowerCase()) return false
+    if (actual.toLowerCase() !== expectedHash.toLowerCase()) return rejected
     const artifact = JSON.parse(bytes.toString("utf8"))
     const gates = artifact?.gates
     const metrics = artifact?.metrics
@@ -101,41 +195,73 @@ function verifiedEvidence(path?: string, expectedHash?: string, expectedCandidat
       gates?.schema === true && gates?.manifest_identity === true &&
       gates?.provenance === true && gates?.holdout === true &&
       gates?.remote_fallback === true && gates?.rss === true &&
-      gates?.safety === true &&
+      gates?.safety === true && gates?.reproducibility === true && gates?.holdout_evaluation === true &&
       gates?.non_regression === true &&
       artifact?.comparison?.pass === true &&
       Number.isFinite(artifact?.comparison?.threshold) &&
       Number.isFinite(metrics?.tesseract?.records) && metrics.tesseract.records > 0 &&
       Number.isFinite(metrics?.production?.records) && metrics.production.records > 0 &&
-      artifact?.results?.path && /^[a-f0-9]{64}$/i.test(artifact?.results?.sha256 ?? ""))) return false
+      artifact?.results?.path && /^[a-f0-9]{64}$/i.test(artifact?.results?.sha256 ?? ""))) return rejected
 
-    const base = dirname(path)
+     const base = dirname(path)
     const manifestPath = resolve(base, artifact.manifest.path)
     const resultsPath = resolve(base, artifact.results.path)
     const manifestBytes = readFileSync(manifestPath)
-    if (createHash("sha256").update(manifestBytes).digest("hex") !== artifact.manifest.sha256) return false
+    if (createHash("sha256").update(manifestBytes).digest("hex") !== artifact.manifest.sha256) return rejected
     const manifest = JSON.parse(manifestBytes.toString("utf8"))
-    if (manifest.schema_version !== 2 || manifest.provenance?.authorship !== "human" || manifest.provenance?.blinding !== "holdout" || !Array.isArray(manifest.holdout) || manifest.holdout.length === 0) return false
-    if (!artifact.ui_assertions || JSON.stringify(artifact.ui_assertions) !== JSON.stringify(manifest.ui_assertions)) return false
+    if (manifest.schema_version !== 2 || manifest.provenance?.authorship !== "human" || manifest.provenance?.blinding !== "holdout" || !Array.isArray(manifest.holdout) || manifest.holdout.length === 0) return rejected
+    const holdoutEvaluation = artifact.holdout_evaluation
+    if (!holdoutEvaluation || typeof holdoutEvaluation.path !== "string" || !/^[a-f0-9]{64}$/i.test(holdoutEvaluation.sha256 ?? "")) return rejected
+    const holdoutEvaluationPath = resolve(base, holdoutEvaluation.path)
+    const holdoutEvaluationBytes = readFileSync(holdoutEvaluationPath)
+    if (createHash("sha256").update(holdoutEvaluationBytes).digest("hex") !== holdoutEvaluation.sha256) return rejected
+    const holdoutEvaluationArtifact = JSON.parse(holdoutEvaluationBytes.toString("utf8"))
+    if (holdoutEvaluationArtifact.schema_version !== 2 || holdoutEvaluationArtifact.frozen !== true || holdoutEvaluationArtifact.split !== "holdout" || holdoutEvaluationArtifact.review !== "independent" || holdoutEvaluationArtifact.manifest_sha256 !== artifact.manifest.sha256 || holdoutEvaluationArtifact.candidate_model !== artifact.candidate_model || holdoutEvaluationArtifact.decision !== "independent-held-out-review" || !Array.isArray(holdoutEvaluationArtifact.holdout_ids) || JSON.stringify([...holdoutEvaluationArtifact.holdout_ids].sort()) !== JSON.stringify([...manifest.holdout].sort())) return rejected
+    if (!holdoutEvaluationArtifact.results || typeof holdoutEvaluationArtifact.results.path !== "string" || !/^[a-f0-9]{64}$/i.test(holdoutEvaluationArtifact.results.sha256 ?? "") || !holdoutEvaluationArtifact.scorer || typeof holdoutEvaluationArtifact.scorer.path !== "string" || !/^[a-f0-9]{64}$/i.test(holdoutEvaluationArtifact.scorer.sha256 ?? "")) return rejected
+    const evaluationResultsBytes = readFileSync(resolve(base, holdoutEvaluationArtifact.results.path))
+    if (createHash("sha256").update(evaluationResultsBytes).digest("hex") !== holdoutEvaluationArtifact.results.sha256) return rejected
+    const scorerBytes = readFileSync(resolve(base, holdoutEvaluationArtifact.scorer.path))
+    if (createHash("sha256").update(scorerBytes).digest("hex") !== holdoutEvaluationArtifact.scorer.sha256) return rejected
+     const scorer = JSON.parse(scorerBytes.toString("utf8"))
+     if (canonical(scorer) !== canonical(FROZEN_SCORER)) return rejected
+     if (!verifyAttestation(artifact, expectedHash, expectedCandidate ?? artifact.candidate_model, expectedBaseline ?? artifact.baseline_model, String(opts.configSha256 ?? ""), sha256(scorerBytes), opts)) return rejected
+    const holdoutRecords = evaluationResultsBytes.toString("utf8").split("\n").filter(Boolean).map(JSON.parse)
+    const holdoutSamples = new Map((manifest.corpus ?? []).filter((sample: any) => sample.split === "holdout").map((sample: any) => [sample.id, sample]))
+    const means = new Map<string, number[]>()
+    for (const record of holdoutRecords) {
+      const sample = holdoutSamples.get(record.sample_id)
+      if (!sample || record.schema_version !== 2 || record.split !== "holdout" || !["baseline", "candidate"].includes(record.role) || record.model !== (record.role === "candidate" ? artifact.candidate_model : artifact.baseline_model) || sample.fixture?.path !== record.fixture?.path || sample.fixture?.sha256 !== record.fixture?.sha256 || sample.oracle?.path !== record.oracle?.path || sample.oracle?.sha256 !== record.oracle?.sha256 || typeof record.raw_output !== "string" || record.raw_output_sha256 !== createHash("sha256").update(record.raw_output).digest("hex") || !Array.isArray(record.errors) || record.errors.length || record.timed_out === true || record.rss?.gate_pass !== true || !Number.isFinite(record.rss?.peak_aggregate_mb) || record.rss.peak_aggregate_mb * 1024 * 1024 >= 40 * 1024 * 1024 * 1024 || record.scores?.exact_value_safety !== true || record.scores?.span_safety !== true || record.scores?.ui_assertions?.pass !== true || record.scores?.pass !== true) return rejected
+      const score = recomputedScore(record, base)
+      if (!score || score.total < 0.8 || !score.exact_value_safety || !score.span_safety) return rejected
+      means.set(record.role, [...(means.get(record.role) ?? []), score.total])
+    }
+    for (const sampleId of holdoutSamples.keys()) for (const role of ["baseline", "candidate"]) {
+      const group = holdoutRecords.filter((record: any) => record.sample_id === sampleId && record.role === role)
+      if (group.length < 2 || new Set(group.map((record: any) => record.raw_output_sha256)).size !== 1) return rejected
+    }
+    if (holdoutSamples.size === 0 || !means.get("baseline")?.length || !means.get("candidate")?.length) return rejected
+    const mean = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
+    if (mean(means.get("candidate")!) < mean(means.get("baseline")!) * 0.95) return rejected
+    if (!artifact.ui_assertions || JSON.stringify(artifact.ui_assertions) !== JSON.stringify(manifest.ui_assertions)) return rejected
     const uiPath = resolve(base, manifest.ui_assertions.path)
-    if (createHash("sha256").update(readFileSync(uiPath)).digest("hex") !== manifest.ui_assertions.sha256) return false
+    if (createHash("sha256").update(readFileSync(uiPath)).digest("hex") !== manifest.ui_assertions.sha256) return rejected
     const ui = JSON.parse(readFileSync(uiPath).toString("utf8"))
-    if (ui.schema_version !== 1 || ui.synthetic_text !== true || ui.no_image_file_parts !== true || ui.local_transport !== true || ui.remote_fallback !== false) return false
+    if (ui.schema_version !== 1 || ui.synthetic_text !== true || ui.no_image_file_parts !== true || ui.local_transport !== true || ui.remote_fallback !== false) return rejected
     const resultBytes = readFileSync(resultsPath)
-    if (createHash("sha256").update(resultBytes).digest("hex") !== artifact.results.sha256) return false
+    if (createHash("sha256").update(resultBytes).digest("hex") !== artifact.results.sha256) return rejected
     const samples = new Map((manifest.corpus ?? []).map((sample: any) => [sample.id, sample]))
     const fixtureHashes = new Map<string, { id: string; split: string }>()
     const oracleHashes = new Map<string, { id: string; split: string }>()
     for (const sample of manifest.corpus ?? []) {
       for (const [label, hash, seen] of [["fixture", sample.fixture?.sha256, fixtureHashes], ["oracle", sample.oracle?.sha256, oracleHashes]] as const) {
-        if (typeof hash !== "string") return false
+        if (typeof hash !== "string") return rejected
         const previous = seen.get(hash)
-        if (previous && previous.id !== sample.id && (previous.split !== sample.split || sample.split === "holdout")) return false
+        if (previous && previous.id !== sample.id && (previous.split !== sample.split || sample.split === "holdout")) return rejected
         seen.set(hash, { id: sample.id, split: sample.split })
       }
     }
     const records = resultBytes.toString("utf8").split("\n").filter(Boolean).map(JSON.parse)
-    if (!records.length || !records.some((r: any) => r.role === "apple") || !records.some((r: any) => r.role === "tesseract") || !records.some((r: any) => r.role === "production")) return false
+    if (!records.length || !records.some((r: any) => r.role === "apple") || !records.some((r: any) => r.role === "tesseract") || !records.some((r: any) => r.role === "production")) return rejected
     for (const record of records) {
       const sample = samples.get(record.sample_id)
       const expectedModel = record.role === "production"
@@ -154,21 +280,33 @@ function verifiedEvidence(path?: string, expectedHash?: string, expectedCandidat
         record.rss?.gate_pass !== true ||
         (record.scores?.exact_value_safety ?? record.scores?.authoritative?.exact_value_safety) !== true ||
         (record.scores?.span_safety ?? record.scores?.authoritative?.span_safety) !== true ||
-        record.scores?.ui_assertions?.pass !== true || record.provenance?.production_enabled === true) return false
+        record.scores?.ui_assertions?.pass !== true || record.provenance?.production_enabled === true || !recomputedScore(record, base)) return rejected
     }
     const meanScore = (role: string) => {
       const roleRecords = records.filter((record: any) => record.role === role)
-      const values = roleRecords.map((record: any) => Number(record.scores?.total ?? record.scores?.authoritative?.total))
+      const values = roleRecords.map((record: any) => recomputedScore(record, base)?.total ?? NaN)
       return values.length > 0 && values.every(Number.isFinite)
         ? values.reduce((sum: number, value: number) => sum + value, 0) / values.length
         : NaN
     }
     const baselineScore = meanScore("tesseract")
     const candidateScore = meanScore("production")
-    if (!Number.isFinite(baselineScore) || !Number.isFinite(candidateScore) || candidateScore < baselineScore * 0.95) return false
-    return true
+    if (!Number.isFinite(baselineScore) || !Number.isFinite(candidateScore) || candidateScore < baselineScore * 0.95) return rejected
+    const repeated = new Map<string, any[]>()
+    for (const record of records) {
+      const key = `${record.sample_id}\0${record.role}`
+      repeated.set(key, [...(repeated.get(key) ?? []), record])
+    }
+    for (const group of repeated.values()) {
+      if (group.length < 2 || new Set(group.map(record => record.raw_output_sha256)).size !== 1 || group.some(record => record.errors?.length || record.timed_out === true)) return rejected
+    }
+     const capabilities = artifact.attestation.capabilities as string[]
+     return {
+       evidence: capabilities.includes("visionCandidate"),
+       stickyNotes: capabilities.includes("stickyNotes"),
+     }
   } catch {
-    return false
+    return rejected
   }
 }
 
@@ -304,8 +442,12 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
   const agentKinds = new Set(opts.agentKinds ?? ["image"])
   const configuredBaselineModel = opts.visionModel ?? "gemma4:12b"
   const configuredCandidateModel = opts.visionCandidateModel ?? "qwen2.5vl:7b"
-  const evidenceVerified = verifiedEvidence(opts.evidencePath, opts.evidenceSha256, configuredCandidateModel, configuredBaselineModel)
-  const candidateEnabled = opts.visionCandidateEnabled === true && evidenceVerified
+  const admission = verifiedEvidence(opts.evidencePath, opts.evidenceSha256, configuredCandidateModel, configuredBaselineModel, opts)
+  const evidenceVerified = admission.evidence
+  const candidateRequested = opts.visionCandidateEnabled === true
+  const candidateEnabled = candidateRequested && evidenceVerified
+  const forceDeterministicOnRejectedCandidate = candidateRequested && !evidenceVerified
+  const stickyNotesEnabled = candidateEnabled && admission.stickyNotes
   const visionEnabled = opts.visionEnabled !== false
   const visionModel = candidateEnabled
     ? configuredCandidateModel
@@ -384,6 +526,26 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
     }
     if (url.startsWith("/")) return url
     return null // http(s) or anything not locally reachable
+  }
+
+  const uploadSize = (part: any): string => {
+    const path = resolvePath(part)
+    if (!path) return "size unavailable"
+    try {
+      const bytes = statSync(path).size
+      const units = ["B", "KiB", "MiB", "GiB"]
+      let value = bytes
+      let unit = 0
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024
+        unit++
+      }
+      const formatted = value.toFixed(value >= 10 ? 0 : 1).replace(/\.0$/, "")
+      const human = unit === 0 ? `${bytes} B` : `${formatted} ${units[unit]}`
+      return `${human}, ${bytes} bytes`
+    } catch {
+      return "size unavailable"
+    }
   }
 
   // Call extract.py; returns parsed JSON or null on hard failure.
@@ -583,9 +745,20 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
 
     // IMAGE agent branch (gated by forceDeterministic)
     if (kind === "image" && agentKinds.has("image") && !ctl.forceDeterministic && path) {
-       const classification = await runExtract(path, mime, maxChars, undefined, true, fileDeadline)
-       const isDocument = classification?.meta?.document_image === true
-       if (isDocument) {
+        const stickyClassification = await runExtract(path, mime, maxChars, "sticky-notes", true, fileDeadline)
+        const stickyLabel = stickyClassification?.meta?.classification?.label
+        const stickyRegions = stickyClassification?.meta?.note_regions
+        if (stickyNotesEnabled && (stickyLabel === "sticky_notes" || (Array.isArray(stickyRegions) && stickyRegions.length > 0))) {
+          const res = await runExtract(path, mime, maxChars, "sticky-notes", false, fileDeadline)
+          if (ctl.counters) ctl.counters.agent++
+          const note = extractNote(res, kind, path, `[media-guard] Sticky notes were routed to the local structured vision/OCR pipeline; raw image bytes were not sent.`)
+          win("sticky-notes")
+          return cacheSetAndEvict(ckey, note)
+        }
+        const classification = await runExtract(path, mime, maxChars, undefined, true, fileDeadline)
+        const label = classification?.meta?.classification?.label
+        const isDocument = classification?.meta?.document_image === true || label === "document" || label === "handwriting"
+        if (isDocument) {
          const fallbackHeader = `[media-guard] A detected document image ("${label}") was OCR'd locally before model processing; raw image bytes were not sent.`
          const res = await runExtract(path, mime, maxChars, "production", false, fileDeadline)
          if (ctl.counters) ctl.counters.deterministic++
@@ -653,14 +826,18 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
     matches: Array<{ parts: any[]; index: number; part: any; mime: string }>,
     userGoal: string,
     counters: { agent: number; deterministic: number; pointer: number; error: number },
+    rejectedCandidate = false,
   ): Promise<{ forceDeterministic: boolean; elapsedMs: number }> => {
-    const forceDeterministic = matches.length > batchThreshold
+    const forceDeterministic = rejectedCandidate || matches.length > batchThreshold
     const deadline = Date.now() + transformBudgetMs
     const start = Date.now()
-    await emit(`distilling ${matches.length} media file(s) locally before the model runs — the reply will appear once this finishes`, "info", { count: matches.length, concurrency, forceDeterministic })
+    const uploadSummary = matches.map((m, i) => {
+      const filename = String(m.part?.filename || `attachment-${i + 1}`)
+      return `${filename} (${uploadSize(m.part)})`
+    }).join(", ")
+    await emit(`received ${matches.length} upload(s): ${uploadSummary}; extracting locally before the model runs`, "info", { count: matches.length, concurrency, forceDeterministic })
     await mapWithConcurrency(matches, concurrency, async (m, i) => {
-      const label = m.part?.filename || m.part?.url || "attachment"
-      await emit(`processing ${i + 1}/${matches.length}: ${label}`)
+      const label = m.part?.filename || "attachment"
       const sink: { via?: string } = {}
       let text: string
       try {
@@ -670,7 +847,6 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
         counters.error++
         text = `[media-guard] A media file ("${label}", ${m.mime}) was attached but its content could not be processed (${e instanceof Error ? e.message : String(e)}). It was NOT sent to the model, to avoid leaking raw bytes or breaking the turn. If you need its content, use the media_extract tool on its local path.`
       }
-      await emit(`done ${i + 1}/${matches.length}: ${label} via ${sink.via ?? "unknown"}`)
       try {
         m.parts[m.index] = { id: m.part.id, sessionID: m.part.sessionID, messageID: m.part.messageID, type: "text", text, synthetic: true }
       } catch (e) { console.error("[media-guard] failed to swap media part:", e) }
@@ -698,7 +874,7 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
         }
         if (matches.length === 0) return
         const counters = { agent: 0, deterministic: 0, pointer: 0, error: 0 }
-        const { forceDeterministic, elapsedMs } = await replaceMediaParts(matches, userGoal, counters)
+        const { forceDeterministic, elapsedMs } = await replaceMediaParts(matches, userGoal, counters, forceDeterministicOnRejectedCandidate)
         if (process.env.MEDIA_GUARD_DEBUG) {
           console.error("[media-guard:chat.message] " + JSON.stringify({ matches: matches.length, forceDeterministic, concurrency, batchThreshold, elapsedMs, budgetMs: transformBudgetMs, ...counters }))
         }
@@ -745,7 +921,7 @@ export const MediaGuardPlugin: Plugin = async ({ $, client }, opts: Options = {}
 
       // Phase 2: process with replaceMediaParts
       const counters = { agent: 0, deterministic: 0, pointer: 0, error: 0 }
-      const { forceDeterministic, elapsedMs } = await replaceMediaParts(matches, userGoal, counters)
+      const { forceDeterministic, elapsedMs } = await replaceMediaParts(matches, userGoal, counters, forceDeterministicOnRejectedCandidate)
 
       // Phase 3: Reassign parts to trigger reactivity on touched messages
       const touchedMessages = new Set<any>()

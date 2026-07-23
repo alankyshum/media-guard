@@ -10,6 +10,7 @@ const OLLAMA_URL = "http://127.0.0.1:11434"
 const RSS_LIMIT_BYTES = 40 * 1024 * 1024 * 1024
 const SCHEMA_VERSION = 2
 const NON_REGRESSION_THRESHOLD = 0.95
+const TOTAL_SCORE_THRESHOLD = 0.8
 
 function help() {
   console.log(`Usage: bun benchmark_local_vision.mjs [options]
@@ -23,7 +24,8 @@ Options:
   --sample-ms <n>          RSS sampling interval (default: 250)
   --extract <path>         extract.py path
   --extract-pipeline       Run extract.py Apple/Tesseract/production engines
-  --out <dir>              Artifact directory (must not already exist)
+   --out <dir>              Artifact directory (must not already exist)
+  --holdout-evaluation <path> Frozen independent holdout evaluation artifact
   --check                  Validate manifest, files, hashes, and model inventory
   --dry-run                Validate inputs and print immutable run plan; no inference
   --self-test              Run synthetic valid/rejection tests; no Ollama required
@@ -33,7 +35,7 @@ Options:
 
 function args(argv) {
   const out = { repetitions: 2, timeoutSec: 120, sampleMs: 250, out: DEFAULT_OUT, expectedModel: "qwen2.5vl:7b", baselineModel: "gemma4:12b", extract: resolve(import.meta.dirname, "../media/extract.py") }
-  const keys = { manifest: "manifest", model: "model", "candidate-model": "model", "expected-model": "expectedModel", "current-model": "model", "baseline-model": "baselineModel", repetitions: "repetitions", "timeout-sec": "timeoutSec", "sample-ms": "sampleMs", out: "out", extract: "extract" }
+  const keys = { manifest: "manifest", model: "model", "candidate-model": "model", "expected-model": "expectedModel", "current-model": "model", "baseline-model": "baselineModel", repetitions: "repetitions", "timeout-sec": "timeoutSec", "sample-ms": "sampleMs", out: "out", extract: "extract", "holdout-evaluation": "holdoutEvaluation" }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === "--help" || a === "-h") return { help: true }
@@ -137,7 +139,7 @@ function score(raw, oracle, latency, timeoutSec, ui = {}) {
   const uiPass = ui.synthetic_text === true && ui.no_image_file_parts === true && ui.local_transport === true && ui.remote_fallback === false
   const jsonValid = !!parsed && typeof parsed.content_type === "string" && typeof parsed.summary === "string" && typeof parsed.key_metadata === "object" && Array.isArray(parsed.relevant_spans) && typeof parsed.full_text === "string"
   const total = tokenCoverage * .3 + sim * .25 + metadataAccuracy * .2 + (exactValues ? .1 : 0) + (spans ? .1 : 0) + speed * .05
-  const pass = jsonValid && exactValues && spans && uiPass && total >= .8
+   const pass = jsonValid && exactValues && spans && uiPass && total >= TOTAL_SCORE_THRESHOLD
   return { json_valid: jsonValid, required_tokens_coverage: tokenCoverage, normalized_levenshtein_similarity: sim, structured_metadata_accuracy: metadataAccuracy, exact_value_safety: exactValues, span_safety: spans, speed_latency: speed, ui_assertions: { ...ui, pass: uiPass }, total, pass }
 }
 
@@ -159,7 +161,7 @@ function scoreExtract(raw, oracle, latency, timeoutSec, ui = {}) {
   const authoritative = scoreText(parsed?.text, oracle, latency, timeoutSec)
   const corrected = scoreText(parsed?.corrected_text ?? parsed?.text, oracle, latency, timeoutSec)
   const uiPass = ui.synthetic_text === true && ui.no_image_file_parts === true && ui.local_transport === true && ui.remote_fallback === false
-  return { json_valid: parsed?.status === "ok" && typeof parsed?.text === "string", authoritative, corrected, ui_assertions: { ...ui, pass: uiPass }, pass: parsed?.status === "ok" && authoritative.exact_value_safety && authoritative.span_safety && uiPass && authoritative.total >= .8 }
+   return { json_valid: parsed?.status === "ok" && typeof parsed?.text === "string", authoritative, corrected, ui_assertions: { ...ui, pass: uiPass }, pass: parsed?.status === "ok" && authoritative.exact_value_safety && authoritative.span_safety && uiPass && authoritative.total >= TOTAL_SCORE_THRESHOLD }
 }
 
 function validateRecord(r) {
@@ -242,6 +244,52 @@ function compareCandidates(baseline, candidate) {
   }
 }
 
+function reproducibility(records) {
+  const groups = new Map()
+  for (const record of records) {
+    const key = `${record.sample_id}\0${record.role}`
+    const group = groups.get(key) ?? []
+    group.push(record)
+    groups.set(key, group)
+  }
+  const failures = []
+  for (const [key, group] of groups) {
+    const hashes = new Set(group.map(record => record.raw_output_sha256))
+    if (group.length < 2 || hashes.size !== 1 || group.some(record => record.errors.length || record.timed_out)) failures.push(key)
+  }
+  return { pass: failures.length === 0, groups: groups.size, failures }
+}
+
+function validateHoldoutEvaluation(path, manifest, manifestHash, candidateModel, baselineModel) {
+  if (!path) fail("frozen holdout evaluation artifact is required")
+  const bytes = readFileSync(resolve(path))
+  const evaluation = readJson(path)
+  const base = resolve(path, "..")
+  if (evaluation.schema_version !== 2 || evaluation.frozen !== true || evaluation.split !== "holdout" || evaluation.review !== "independent" || evaluation.manifest_sha256 !== manifestHash || evaluation.candidate_model !== candidateModel || evaluation.decision !== "independent-held-out-review" || !Array.isArray(evaluation.holdout_ids)) fail("invalid frozen holdout evaluation artifact")
+  if (!evaluation.results?.path || !/^[a-f0-9]{64}$/.test(evaluation.results.sha256) || !evaluation.scorer?.path || !/^[a-f0-9]{64}$/.test(evaluation.scorer.sha256)) fail("holdout results and scorer must be hash-bound")
+  const holdoutIds = manifest.corpus.filter(sample => sample.split === "holdout").map(sample => sample.id).sort()
+  if (JSON.stringify([...evaluation.holdout_ids].sort()) !== JSON.stringify(holdoutIds)) fail("holdout evaluation IDs do not match manifest")
+  const resultsPath = resolve(base, evaluation.results.path)
+  const scorerPath = resolve(base, evaluation.scorer.path)
+  hashFile(resultsPath, evaluation.results.sha256, "holdout results")
+  hashFile(scorerPath, evaluation.scorer.sha256, "scorer")
+  const scorer = readJson(scorerPath)
+  if (scorer.schema_version !== 1 || scorer.thresholds?.total !== TOTAL_SCORE_THRESHOLD || scorer.thresholds?.non_regression !== NON_REGRESSION_THRESHOLD) fail("scorer thresholds are not frozen")
+  const samples = new Map(manifest.corpus.filter(sample => sample.split === "holdout").map(sample => [sample.id, sample]))
+  const records = readFileSync(resultsPath, "utf8").split("\n").filter(Boolean).map(JSON.parse)
+  for (const record of records) {
+    const sample = samples.get(record.sample_id)
+    if (!sample || record.schema_version !== SCHEMA_VERSION || record.split !== "holdout" || !["baseline", "candidate"].includes(record.role) || record.model !== (record.role === "candidate" ? candidateModel : baselineModel) || sample.fixture.path !== record.fixture?.path || sample.fixture.sha256 !== record.fixture?.sha256 || sample.oracle.path !== record.oracle?.path || sample.oracle.sha256 !== record.oracle?.sha256 || typeof record.raw_output !== "string" || record.raw_output_sha256 !== sha256(record.raw_output) || !Array.isArray(record.errors) || record.errors.length || record.timed_out || record.rss?.gate_pass !== true || record.rss.peak_aggregate_mb * 1024 * 1024 >= RSS_LIMIT_BYTES || record.scores?.pass !== true || Number(record.scores?.total) < TOTAL_SCORE_THRESHOLD || record.scores?.exact_value_safety !== true || record.scores?.span_safety !== true || record.scores?.ui_assertions?.pass !== true) fail(`invalid holdout record: ${record.run_id ?? "unknown"}`)
+  }
+  for (const sampleId of samples.keys()) for (const role of ["baseline", "candidate"]) {
+    const group = records.filter(record => record.sample_id === sampleId && record.role === role)
+    if (group.length < 2 || new Set(group.map(record => record.raw_output_sha256)).size !== 1) fail(`holdout reproducibility failed: ${sampleId}/${role}`)
+  }
+  const mean = role => records.filter(record => record.role === role).reduce((sum, record) => sum + Number(record.scores.total), 0) / Math.max(records.filter(record => record.role === role).length, 1)
+  if (mean("candidate") < mean("baseline") * NON_REGRESSION_THRESHOLD) fail("holdout candidate regressed below baseline")
+  return { path: resolve(path), sha256: sha256(bytes) }
+}
+
 async function installedVisionModels() { const r = await fetch(`${OLLAMA_URL}/api/tags`); if (!r.ok) fail(`Ollama tags HTTP ${r.status}`); return ((await r.json()).models ?? []).map(m => m.name).sort() }
 function sampleRss(pids, interval, sink) { let timer, pending = Promise.resolve(); const sample = () => { const p = spawn("ps", ["-o", "pid=,rss=", "-p", [process.pid, ...pids].filter(Boolean).join(",")]); let text = ""; p.stdout.on("data", d => { text += d }); pending = new Promise(done => p.on("close", () => { const values = text.trim().split("\n").map(x => x.trim().split(/\s+/).map(Number)).filter(x => x.length === 2 && x.every(Number.isFinite)); const client = values.find(([pid]) => pid === process.pid)?.[1] ?? 0, ollama = values.filter(([pid]) => pids.includes(pid)).reduce((n, [, rss]) => n + rss, 0); sink.push({ at: new Date().toISOString(), aggregate_mb: (client + ollama) / 1024, client_mb: client / 1024, ollama_mb: ollama / 1024 }); done() })) }; sample(); timer = setInterval(sample, interval); return async () => { clearInterval(timer); await pending; return sink } }
 async function pids() { return new Promise(resolvePids => { const p = spawn("pgrep", ["-f", "ollama"]); let text = ""; p.stdout.on("data", d => { text += d }); p.on("close", () => resolvePids(text.trim().split("\n").map(Number).filter(Boolean))) }) }
@@ -277,9 +325,10 @@ async function main() {
   if (!o.manifest) fail("--manifest required; unbound fixture/oracle inputs rejected")
   const manifestPath = resolve(o.manifest), manifestBase = resolve(manifestPath, ".."), manifestBytes = readFileSync(manifestPath), manifestHash = sha256(manifestBytes)
   const manifest = readJson(manifestPath); validateManifest(manifest, manifestBase)
+  const holdoutEvaluation = o.dryRun || o.check ? null : validateHoldoutEvaluation(o.holdoutEvaluation, manifest, manifestHash, o.extractPipeline ? "extract.py:production" : o.model, o.extractPipeline ? "extract.py:tesseract" : o.baselineModel)
   const ui = readJson(resolve(manifestBase, manifest.ui_assertions.path))
   if (o.validate) { validateArtifact(o.validate, manifest, manifestBase); console.log(`VALID AUDIT ARTIFACT: ${o.validate}`); return }
-  if (o.dryRun && !o.check) { console.log(JSON.stringify({ dry_run: true, schema_version: SCHEMA_VERSION, pipeline: o.extractPipeline ? "extract.py" : "ollama", candidate_model: o.extractPipeline ? "extract.py:correction" : o.model, baseline_model: o.extractPipeline ? "extract.py:baseline" : o.baselineModel, extract: o.extract, samples: manifest.corpus.map(x => x.id), holdout: manifest.holdout ?? [], timeout_sec: o.timeoutSec, rss_limit_bytes: RSS_LIMIT_BYTES, remote_fallback: false, production_enabled: false, immutable_artifacts: true }, null, 2)); return }
+   if (o.dryRun && !o.check) { console.log(JSON.stringify({ dry_run: true, schema_version: SCHEMA_VERSION, pipeline: o.extractPipeline ? "extract.py" : "ollama", candidate_model: o.extractPipeline ? "extract.py:correction" : o.model, baseline_model: o.extractPipeline ? "extract.py:baseline" : o.baselineModel, extract: o.extract, samples: manifest.corpus.map(x => x.id), holdout: manifest.holdout ?? [], timeout_sec: o.timeoutSec, rss_limit_bytes: RSS_LIMIT_BYTES, total_score_threshold: TOTAL_SCORE_THRESHOLD, non_regression_threshold: NON_REGRESSION_THRESHOLD, gates: ["detection", "text", "privacy", "rss", "latency", "reproducibility", "non_regression"], timeout_is_failure: true, remote_fallback: false, production_enabled: false, immutable_artifacts: true }, null, 2)); return }
    if (o.extractPipeline) {
     if (!existsSync(o.extract)) fail(`extract.py missing: ${o.extract}`)
     if (existsSync(o.out)) fail(`output directory already exists: ${o.out}`)
@@ -306,10 +355,12 @@ async function main() {
     }
     writeImmutable(jsonl, records.map(record => JSON.stringify(record)).join("\n") + "\n")
     validateFile(jsonl)
-      const resultsHash = sha256(readFileSync(jsonl)), byEngine = engineMetrics(records), baselineRecords = records.filter(r => r.role === "tesseract"), candidateRecords = records.filter(r => r.role === "production")
+       const resultsHash = sha256(readFileSync(jsonl)), byEngine = engineMetrics(records), baselineRecords = records.filter(r => r.role === "tesseract"), candidateRecords = records.filter(r => r.role === "production"), reproducibilityGate = reproducibility(records)
       const comparison = compareCandidates(extractMetrics(baselineRecords), extractMetrics(candidateRecords))
-      const decision = { schema_version: SCHEMA_VERSION, manifest: { path: o.manifest, sha256: manifestHash }, results: { path: jsonl, sha256: resultsHash }, pipeline: "extract.py", candidate_model: "extract.py:production", baseline_model: "extract.py:tesseract", metrics: byEngine, comparison: { ...comparison, compared: ["tesseract", "production"], apple: byEngine.apple, authoritative_field: "text/original_text", production_enabled: false }, holdout: manifest.holdout ?? [], ui_assertions: manifest.ui_assertions, gates: { schema: true, manifest_identity: true, provenance: true, holdout: true, remote_fallback: true, production_disabled: true, rss: records.every(r => r.rss.gate_pass), safety: records.every(r => r.scores.authoritative.exact_value_safety && r.scores.authoritative.span_safety), non_regression: comparison.pass }, decision: "computed-from-validated-records", remote_fallback: false }
-      if (!comparison.pass) fail(`production extractor regressed below ${NON_REGRESSION_THRESHOLD * 100}% of Tesseract`)
+       const decision = { schema_version: SCHEMA_VERSION, manifest: { path: o.manifest, sha256: manifestHash }, results: { path: jsonl, sha256: resultsHash }, holdout_evaluation: holdoutEvaluation, pipeline: "extract.py", candidate_model: "extract.py:production", baseline_model: "extract.py:tesseract", metrics: byEngine, comparison: { ...comparison, compared: ["tesseract", "production"], apple: byEngine.apple, authoritative_field: "text/original_text", production_enabled: false }, holdout: manifest.holdout ?? [], ui_assertions: manifest.ui_assertions, gates: { schema: true, manifest_identity: true, provenance: true, holdout: true, holdout_evaluation: true, remote_fallback: true, production_disabled: true, rss: records.every(r => r.rss.gate_pass), latency: records.every(r => !r.timed_out && !r.errors.length), reproducibility: reproducibilityGate.pass, safety: records.every(r => r.scores.authoritative.exact_value_safety && r.scores.authoritative.span_safety), non_regression: comparison.pass }, decision: "computed-from-validated-records", remote_fallback: false }
+       if (!comparison.pass) fail(`production extractor regressed below ${NON_REGRESSION_THRESHOLD * 100}% of Tesseract`)
+     if (records.some(r => r.timed_out || r.errors.length)) fail("latency/error gate failed")
+     if (!reproducibilityGate.pass) fail(`reproducibility gate failed: ${reproducibilityGate.failures.join(", ")}`)
     writeImmutable(join(o.out, `decision-${stamp}.json`), JSON.stringify(decision, null, 2))
     console.log(JSON.stringify({ jsonl, artifacts: o.out, pipeline: "extract.py", production_enabled: false }))
     return
@@ -323,15 +374,19 @@ async function main() {
   for (const sample of manifest.corpus.filter(x => x.split === "benchmark" && !manifest.holdout.includes(x.id))) for (const [role, model] of [["baseline", o.baselineModel], ["candidate", o.model]]) for (let i = 0; i <= o.repetitions; i++) { const image = readFileSync(resolve(manifestBase, sample.fixture.path)).toString("base64"), oracle = readJson(resolve(manifestBase, sample.oracle.path)), result = await infer(model, image, prompt, o.timeoutSec, o.sampleMs), record = { schema_version: SCHEMA_VERSION, run_id: `${stamp}-${sample.id}-${role}-${i}`, role, model, sample_id: sample.id, split: sample.split, fixture: sample.fixture, oracle: sample.oracle, state: i === 0 ? "cold" : `warm-${i}`, latency_ms: result.latencyMs, timed_out: result.errors.some(e => /timeout/i.test(e)), rss: { samples: result.rss, peak_aggregate_mb: result.peak, gate_pass: result.peak * 1024 * 1024 < RSS_LIMIT_BYTES }, scores: score(result.raw, oracle, result.latencyMs, o.timeoutSec, ui), raw_output: result.raw, raw_output_sha256: sha256(result.raw), errors: result.errors }; validateRecord(record); if (!record.rss.gate_pass) fail("40 GiB RSS gate exceeded"); writeImmutable(join(o.out, `raw-${record.run_id}.txt`), result.raw); records.push(record) }
   writeImmutable(jsonl, records.map(record => JSON.stringify(record)).join("\n") + "\n")
   validateFile(jsonl)
-  const resultsHash = sha256(readFileSync(jsonl))
+   const resultsHash = sha256(readFileSync(jsonl))
   const baselineRecords = records.filter(r => r.role === "baseline")
   const candidateRecords = records.filter(r => r.role === "candidate")
-  const comparison = compareCandidates(metrics(baselineRecords), metrics(candidateRecords))
-  if (!comparison.pass) fail(`candidate regressed below ${NON_REGRESSION_THRESHOLD * 100}% of baseline`)
+   const comparison = compareCandidates(metrics(baselineRecords), metrics(candidateRecords))
+   const reproducibilityGate = reproducibility(records)
+   if (!comparison.pass) fail(`candidate regressed below ${NON_REGRESSION_THRESHOLD * 100}% of baseline`)
+     if (records.some(r => r.timed_out || r.errors.length)) fail("latency/error gate failed")
+   if (!reproducibilityGate.pass) fail(`reproducibility gate failed: ${reproducibilityGate.failures.join(", ")}`)
   const decision = {
     schema_version: SCHEMA_VERSION,
     manifest: { path: o.manifest, sha256: manifestHash },
-    results: { path: jsonl, sha256: resultsHash },
+     results: { path: jsonl, sha256: resultsHash },
+     holdout_evaluation: holdoutEvaluation,
     candidate_model: o.model,
     baseline_model: o.baselineModel,
     metrics: { baseline: metrics(baselineRecords), candidate: metrics(candidateRecords) },
@@ -342,11 +397,14 @@ async function main() {
       schema: true,
       manifest_identity: true,
       provenance: true,
-      holdout: true,
+       holdout: true,
+       holdout_evaluation: true,
       remote_fallback: true,
        rss: records.every(r => r.rss.gate_pass),
        safety: records.every(r => r.scores.exact_value_safety && r.scores.span_safety),
-       non_regression: comparison.pass,
+        latency: records.every(r => !r.timed_out && !r.errors.length),
+        reproducibility: reproducibilityGate.pass,
+        non_regression: comparison.pass,
     },
     decision: "computed-from-validated-records",
     remote_fallback: false,

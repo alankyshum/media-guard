@@ -20,6 +20,23 @@ class StickyNoteScoringTests(unittest.TestCase):
         self.assertGreater(result["recall"], 0.99)
         self.assertGreater(result["mean_matched_ocr_similarity"], 0.99)
 
+    def test_route_bbox_is_normalized_against_image_size(self):
+        result = score({
+            "image_size": [1000, 1000],
+            "oracle": [{"box": [100, 200, 300, 400], "text": "note"}],
+            "detections": [{"bbox": [0.1, 0.2, 0.3, 0.4], "text": "note"}],
+        }, 0.5)
+        self.assertEqual(result["true_positives"], 1)
+
+    def test_rejects_fixture_oracle_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "fixture/oracle mismatch"):
+            score({
+                "fixture_id": "quick-share",
+                "oracle_id": "other-fixture",
+                "oracle": [{"box": [0, 0, 1, 1]}],
+                "detections": [],
+            }, 0.5)
+
     def test_unmatched_detection_is_false_positive_and_oracle_is_missed(self):
         result = score(
             {

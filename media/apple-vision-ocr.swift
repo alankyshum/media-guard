@@ -133,11 +133,11 @@ let imageWidth = image.width
 let imageHeight = image.height
 let imageArea = Double(imageWidth) * Double(imageHeight)
 let rectangleRequest = VNDetectRectanglesRequest()
-rectangleRequest.minimumConfidence = 0.20
-rectangleRequest.minimumSize = 0.04
+rectangleRequest.minimumConfidence = 0.10
+rectangleRequest.minimumSize = 0.005
 rectangleRequest.minimumAspectRatio = 0.18
 rectangleRequest.maximumAspectRatio = 5.5
-rectangleRequest.maximumObservations = 32
+rectangleRequest.maximumObservations = 128
 
 do {
     try VNImageRequestHandler(cgImage: image, orientation: .up).perform([rectangleRequest])
@@ -150,7 +150,7 @@ do {
         let height = min(imageHeight - y, max(1, Int(ceil(normalized.height * Double(imageHeight)))))
         let areaFraction = (Double(width) * Double(height)) / imageArea
         let aspect = Double(width) / Double(max(height, 1))
-        if areaFraction < 0.005 || areaFraction > 0.60 || aspect < 0.18 || aspect > 5.5 { continue }
+        if areaFraction < 0.002 || areaFraction > 0.60 || aspect < 0.18 || aspect > 5.5 { continue }
         let crop = CGRect(x: x, y: y, width: width, height: height)
         guard let cropped = image.cropping(to: crop) else { continue }
         let (color, colorful) = averageColor(image, crop: crop)

@@ -53,14 +53,14 @@ fi
 
 echo "VLM OCR backend (preferred image + scanned-PDF OCR):"
 ocr_vlm_base_url="${OCR_VLM_BASE_URL:-http://127.0.0.1:11434}"
-ocr_vlm_model="${OCR_VLM_MODEL:-qwen3-vl:32b}"
+ocr_vlm_model="${OCR_VLM_MODEL:-qwen2.5vl:32b}"
 ollama_tags=""
 if command -v curl >/dev/null 2>&1 && ollama_tags="$(curl -fsS --connect-timeout 2 --max-time 5 "${ocr_vlm_base_url%/}/api/tags" 2>/dev/null)"; then
   echo "  [ok]   Ollama reachable at ${ocr_vlm_base_url}"
   if printf '%s' "$ollama_tags" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"'"$ocr_vlm_model"'"'; then
     echo "  [ok]   Ollama model ${ocr_vlm_model}"
   else
-    echo "  [MISS] Ollama model ${ocr_vlm_model} — ollama pull qwen3-vl:32b"
+     echo "  [MISS] Ollama model ${ocr_vlm_model} — install the configured local model"
   fi
 else
   echo "  [MISS] Ollama at ${ocr_vlm_base_url} — start ollama (brew services start ollama)"
@@ -77,7 +77,8 @@ echo
 echo "Notes:"
 echo " - Missing backends degrade gracefully: the affected media type just gets a"
 echo "   pointer note routing to the relevant skill instead of inline text."
-echo " - VLM OCR degrades to tesseract/PyMuPDF when Ollama or its model is unavailable;"
-echo "   OCR_VLM_ENABLED=0 forces the classic path."
+echo " - Sticky-note VLM uses one bounded qwen2.5vl:32b content-assignment request;"
+echo "   geometry remains owned by local physical-sheet proposals."
+echo " - OCR_VLM_ENABLED=0 forces the classic path."
 echo " - First whisper run downloads the model (~140MB for 'base')."
 exit 0

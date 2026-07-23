@@ -7,6 +7,8 @@ const testDir = import.meta.dir
 const configPath = process.env.MEDIA_GUARD_CONFIG || join(testDir, "..", "..", "..", "config", "opencode", "opencode.jsonc")
 const pluginPath = join(testDir, "..", "media-guard.ts")
 const benchmarkPath = join(testDir, "benchmark_local_vision.mjs")
+const rollbackPath = join(testDir, "verify_rollback.mjs")
+const videoMissPath = join(testDir, "verify_video_local_miss.mjs")
 const config = readFileSync(configPath, "utf8")
 const plugin = readFileSync(pluginPath, "utf8")
 const benchmark = readFileSync(benchmarkPath, "utf8")
@@ -20,6 +22,7 @@ for (const expected of [
   '"visionCandidateEnabled": false',
   '"ocrCorrection": false',
   '"evidenceSha256": ""',
+  '"configSha256": ""',
   '"visionBaseUrl": "http://127.0.0.1:11434"',
   '"visionTimeoutSec": 120',
   '"visionNumCtx": 16384',
@@ -31,7 +34,7 @@ for (const expected of [
 if (!plugin.includes(`opts.visionModel ?? "${baselineModel}"`)) {
   throw new Error("plugin fallback model drifted from baseline configuration")
 }
-for (const expected of ["verifiedEvidence", "visionCandidateEnabled === true && evidenceVerified", "ocrCorrection === true && evidenceVerified", 'artifact?.decision === "computed-from-validated-records"', 'gates?.manifest_identity === true', 'gates?.provenance === true']) {
+for (const expected of ["verifiedEvidence", "candidateRequested && evidenceVerified", "ocrCorrection === true && evidenceVerified", "forceDeterministicOnRejectedCandidate", 'artifact?.decision === "computed-from-validated-records"', 'gates?.manifest_identity === true', 'gates?.provenance === true', 'gates?.reproducibility === true', 'gates?.holdout_evaluation === true', 'artifact.holdout_evaluation']) {
   if (!plugin.includes(expected)) throw new Error(`evidence gate missing ${expected}`)
 }
 for (const expected of ['model, messages:', 'options: { temperature: 0, num_ctx: 16384 }', '/api/chat', 'remote_fallback: false']) {
@@ -48,6 +51,8 @@ for (const expected of [
   'remainingSec',
   'Math.min(timeoutSec, remainingSec)',
   'fallback to deterministic local extraction',
+  'forceDeterministicOnRejectedCandidate',
+  'rejectedCandidate || matches.length > batchThreshold',
 ]) {
   if (!plugin.includes(expected)) throw new Error(`deadline-aware fallback missing ${expected}`)
 }
@@ -63,6 +68,21 @@ const result = spawnSync("bun", [
 if (result.status !== 0 || !result.stdout.includes("--model <tag>")) {
   throw new Error(`benchmark invocation failed:\n${result.stderr}`)
 }
+
+const rollback = spawnSync("bun", [rollbackPath], { encoding: "utf8" })
+if (rollback.status !== 0) throw new Error(`rollback verification failed:\n${rollback.stdout}\n${rollback.stderr}`)
+if (!rollback.stdout.includes('"opposite_mode_key_miss":true') ||
+     !rollback.stdout.includes('"output_matches_independent_baseline":true') ||
+     !rollback.stdout.includes('"evidence_scope":"gate-mechanics-only; synthetic evidence is not quality proof"') ||
+    !rollback.stdout.includes('"enabled_candidate":1') ||
+    !rollback.stdout.includes('"disabled_candidate":0')) {
+  throw new Error(`rollback verification missing required trace:\n${rollback.stdout}`)
+}
+console.log(`ROLLBACK_TRACE ${rollback.stdout.trim()}`)
+
+const videoMiss = spawnSync("bun", [videoMissPath], { encoding: "utf8" })
+if (videoMiss.status !== 0) throw new Error(`video miss regression failed:\n${videoMiss.stdout}\n${videoMiss.stderr}`)
+console.log(`VIDEO_TRACE ${videoMiss.stdout.trim()}`)
 
 const rollbackConfig = config
   .replace('"visionCandidateEnabled": false', '"visionCandidateEnabled": true')
