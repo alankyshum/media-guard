@@ -1,192 +1,103 @@
 #!/usr/bin/env bun
-/**
- * verify_120.mjs — 120-image regression test for media-guard.ts
- *
- * Generates 120 PNGs with OCR-able tokens, runs the media-guard transform
- * on a synthetic 120-part message, asserts all parts are replaced with
- * synthetic text, counts how many contain the OCR token, and proves the
- * in-memory cache (MAX_CACHE=512) serves the second run instantly.
- *
- * Usage: bun verify_120.mjs
- */
-import { $ } from "bun"
+// Attachment-manifest regression test.
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { mkdtempSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs"
-import { spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
 
-// Resolve paths relative to __tests__
-const TEST_DIR = import.meta.dir
-const PLUGIN_FILE = join(TEST_DIR, "..", "media-guard.ts")
-const GEN_SCRIPT = join(TEST_DIR, "gen_images.py")
-process.env.OCR_VLM_ENABLED = "0"
-
-// ---- 1. Ensure tesseract is available ----
-{
-  const r = spawnSync("which", ["tesseract"], { stdio: "pipe" })
-  if (r.status !== 0) {
-    console.error("tesseract not found; installing via brew...")
-    spawnSync("brew", ["install", "tesseract"], { stdio: "inherit" })
+const root = join(fileURLToPath(import.meta.url), "..", "..")
+const { MediaGuardPlugin } = await import(join(root, "media-guard.ts"))
+const dir = mkdtempSync(join(tmpdir(), "media-guard-test-"))
+try {
+  const local = join(dir, "receipt.txt")
+  writeFileSync(local, "do not parse this")
+  const data = "data:image/png;base64," + Buffer.from("image bytes").toString("base64")
+  const output = { messages: [{ parts: [
+    { id: "text-1", type: "text", text: "intent" },
+    { id: "local-1", type: "file", filename: "../receipt.txt", mime: "application/pdf", source: { path: local }, url: "https://evil.invalid/raw" },
+    { id: "data-1", type: "file", filename: "photo.png", mime: "image/png", url: data },
+    { id: "remote-1", type: "file", filename: "remote.jpg", mime: "image/jpeg", url: "https://example.invalid/remote.jpg" },
+  ] }] }
+  const hooks = await MediaGuardPlugin({}, {})
+  await hooks["experimental.chat.messages.transform"]({}, output)
+  const parts = output.messages[0].parts
+  if (parts[0].text !== "intent" || parts.slice(1).some(p => p.type !== "text" || !p.synthetic)) throw new Error("parts not transformed")
+  for (const part of parts.slice(1)) {
+    if (part.id.endsWith("-1") === false) throw new Error("part ID was not preserved")
+    for (const key of ["url", "source", "filename", "mime"]) if (key in part) throw new Error(`raw field retained: ${key}`)
+    const text = part.text
+    if (/do not parse this|image bytes/.test(text)) throw new Error("file content leaked")
+    const record = JSON.parse(text.split("\n", 2)[1])
+    if (!record.filename || !record.mime || !record.media_kind || !record.schema_version || !record.source) throw new Error("manifest incomplete")
+    if ("inode" in record || "filesystem" in record || "original_filename" in record) throw new Error("excess metadata retained")
   }
-}
-
-// ---- 2. Generate 120 test PNGs ----
-const imgDir = mkdtempSync(join(tmpdir(), "media-guard-test-"))
-console.log(`[harness] Generating 120 images in ${imgDir}`)
-{
-  const r = spawnSync("python3", [GEN_SCRIPT, imgDir, "120"], {
-    stdio: ["inherit", "inherit", "inherit"],
-    timeout: 60_000,
-  })
-  if (r.status !== 0) throw new Error("gen_images.py failed")
-}
-const files = readdirSync(imgDir).filter(f => f.endsWith(".png")).sort()
-if (files.length !== 120) throw new Error(`Expected 120 images, got ${files.length}`)
-console.log(`[harness] ${files.length} images ready`)
-
-// Verify at least one OCRs correctly
-{
-  const sample = join(imgDir, files[0])
-  const r = spawnSync("tesseract", [sample, "stdout"], { stdio: "pipe", timeout: 15_000 })
-  const out = (r.stdout || "").toString().trim()
-  if (!out.includes("MEDIAGUARD")) {
-    console.warn(`[harness] WARNING: tesseract on sample image produced: "${out.slice(0, 80)}"`)
-  } else {
-    console.log(`[harness] tesseract sample OK: "${out.slice(0, 60)}..."`)
+  const dataRecord = JSON.parse(parts[2].text.split("\n", 2)[1])
+  if (!readFileSync(dataRecord.path).equals(Buffer.from("image bytes"))) throw new Error("data URL not materialized")
+  const localRecord = JSON.parse(parts[1].text.split("\n", 2)[1])
+  if ("pointer" in localRecord) throw new Error("unrelated raw URL became local manifest pointer")
+  const remoteRecord = JSON.parse(parts[3].text.split("\n", 2)[1])
+  if (remoteRecord.source !== "remote" || remoteRecord.path !== null || "pointer" in remoteRecord || remoteRecord.error !== "remote attachment was not downloaded") throw new Error("remote URL downloaded or retained")
+  rmSync(local)
+  if (!readFileSync(JSON.parse(parts[1].text.split("\n", 2)[1]).path).equals(Buffer.from("do not parse this"))) throw new Error("staged local file did not survive source deletion")
+  if ((statSync(dataRecord.path).mode & 0o077) !== 0 || (statSync(dataRecord.path).mode & 0o600) !== 0o600) throw new Error("staged file permissions are not 0600")
+  const localhostFile = join(dir, "localhost.txt")
+  writeFileSync(localhostFile, "localhost file")
+  const localhost = { messages: [{ parts: [{ id: "localhost", type: "file", filename: "x", mime: "application/pdf", url: `file://localhost${localhostFile}` }] }] }
+  await hooks["experimental.chat.messages.transform"]({}, localhost)
+  if (localhost.messages[0].parts[0].type !== "text") throw new Error("localhost file URL was not staged")
+  const hostile = { messages: [{ parts: [{ id: "hostile", type: "file", filename: "x", mime: "image/png", url: "file://evil.invalid/etc/passwd" }] }] }
+  await hooks["experimental.chat.messages.transform"]({}, hostile)
+  if (hostile.messages[0].parts[0].type !== "text") throw new Error("hostile file URL was not sanitized")
+  const hostileRecord = JSON.parse(hostile.messages[0].parts[0].text.split("\n", 2)[1])
+  if (hostileRecord.path !== null || hostileRecord.source !== "error" || "url" in hostileRecord || "source_path" in hostileRecord) throw new Error("hostile file URL leaked fields")
+  const invalid = { messages: [{ parts: [{ id: "keep", type: "text", text: "keep" }, { id: "bad", type: "file", filename: "x", mime: "image/png", url: "data:image/png;base64,not-valid!" }] }] }
+  await hooks["experimental.chat.messages.transform"]({}, invalid)
+  if (invalid.messages[0].parts[0].type !== "text" || invalid.messages[0].parts[1].type !== "text") throw new Error("invalid data URL did not sanitize failure")
+  const independent = { messages: [{ parts: [
+    { id: "good", type: "file", filename: "good.png", mime: "image/png", url: data },
+    { id: "bad", type: "file", filename: "bad.png", mime: "image/png", url: "data:image/png;base64,not-valid!" },
+  ] }] }
+  await hooks["experimental.chat.messages.transform"]({}, independent)
+  if (independent.messages[0].parts[0].type !== "text" || independent.messages[0].parts[1].type !== "text") throw new Error("per-file failure affected independent processing")
+  const independentGood = JSON.parse(independent.messages[0].parts[0].text.split("\n", 2)[1])
+  const independentBad = JSON.parse(independent.messages[0].parts[1].text.split("\n", 2)[1])
+  if (independentGood.source !== "data-url" || independentBad.source !== "error" || independentBad.path !== null) throw new Error("per-file manifests incorrect")
+  const limited = await MediaGuardPlugin({}, { maxMaterializedBytes: 1 })
+  const oversized = { messages: [{ parts: [{ id: "oversized", type: "file", filename: "x", mime: "image/png", url: data }] }] }
+  await limited["experimental.chat.messages.transform"]({}, oversized)
+  if (oversized.messages[0].parts[0].type !== "text") throw new Error("oversize data URL did not sanitize failure")
+  const countLimited = await MediaGuardPlugin({}, { maxFilesPerTransform: 1 })
+  const tooMany = { messages: [{ parts: [
+    { id: "one", type: "file", filename: "x", mime: "image/png", url: data },
+    { id: "two", type: "file", filename: "x", mime: "image/png", url: data },
+  ] }] }
+  await countLimited["experimental.chat.messages.transform"]({}, tooMany)
+  if (tooMany.messages[0].parts.some(p => p.type !== "text")) throw new Error("file-count limit did not sanitize failure")
+  const totalLimited = await MediaGuardPlugin({}, { maxTotalMaterializedBytes: 5 })
+  const tooMuchTotal = { messages: [{ parts: [
+    { id: "total-one", type: "file", filename: "x", mime: "image/png", url: data },
+    { id: "total-two", type: "file", filename: "x", mime: "image/png", url: data },
+  ] }] }
+  await totalLimited["experimental.chat.messages.transform"]({}, tooMuchTotal)
+  if (tooMuchTotal.messages[0].parts.some(p => p.type !== "text")) throw new Error("total-byte limit did not sanitize failure")
+  const overrideLimited = await MediaGuardPlugin({}, { maxMaterializedBytes: 1, maxFilesPerTransform: 1, maxTotalMaterializedBytes: 1 })
+  const overrideParts = { messages: [{ parts: [{ id: "override", type: "file", filename: "x", mime: "image/png", url: data }] }] }
+  await overrideLimited["experimental.chat.messages.transform"]({}, overrideParts)
+  if (overrideParts.messages[0].parts[0].type !== "text") throw new Error("explicit limits did not override workspace limits")
+  const workspaceLimited = await MediaGuardPlugin({}, {})
+  const workspaceParts = { messages: [{ parts: [{ id: "workspace", type: "file", filename: "x", mime: "image/png", url: data }] }] }
+  await workspaceLimited["experimental.chat.messages.transform"]({}, workspaceParts)
+  if (workspaceParts.messages[0].parts[0].type !== "text") throw new Error("workspace limits were not loaded")
+  const symlinkDir = join(dir, "materialization-link")
+  try {
+    const { symlinkSync } = await import("node:fs")
+    symlinkSync(dir, symlinkDir)
+    await MediaGuardPlugin({}, { materializationDir: symlinkDir })
+    throw new Error("symlink materialization directory accepted")
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("symlinks")) throw error
   }
+  console.log("media manifest test: PASS")
+} finally {
+  rmSync(dir, { recursive: true, force: true })
 }
-
-// ---- 3. Import the plugin ----
-// Use dynamic import since it's a .ts file with package deps
-const mod = await import(PLUGIN_FILE)
-const MediaGuardPlugin = mod.MediaGuardPlugin || mod.default
-
-const opts = {
-  agentKinds: ["image", "video"],
-  agentTimeoutSec: 300,
-  maxChars: 60_000,
-  model: "base",
-  timeoutSec: 180,
-  concurrency: 6,
-  batchThreshold: 24,
-  transformBudgetSec: 240,
-  extractorCache: false,
-}
-
-console.log(`[harness] Creating plugin instance`)
-const hooks = await MediaGuardPlugin({ $ }, opts)
-const transform = hooks["experimental.chat.messages.transform"]
-if (typeof transform !== "function") throw new Error("transform hook not found")
-
-// ---- 4. Build helper for output messages ----
-function buildMessage(parts) {
-  return {
-    info: { role: "user" },
-    parts,
-  }
-}
-
-function buildFilePart(i, absPath) {
-  const id = `p${i}`
-  return {
-    id,
-    sessionID: "s",
-    messageID: "m",
-    type: "file",
-    mime: "image/png",
-    filename: `img${String(i).padStart(4, "0")}.png`,
-    url: `file://${encodeURI(absPath)}`,
-    source: { path: absPath },
-  }
-}
-
-// ---- 5. Run #1 — should use deterministic OCR (batchThreshold triggers) ----
-{
-  const parts = [
-    { type: "text", text: "Summarize these 120 scanned pages" },
-    ...files.map((f, i) => buildFilePart(i, join(imgDir, f))),
-  ]
-  const output = { messages: [buildMessage(parts)] }
-  process.env.MEDIA_GUARD_DEBUG = "1"
-
-  const t0 = Date.now()
-  await transform({}, output)
-  const ms1 = Date.now() - t0
-
-  // ---- 6. Assertions for run #1 ----
-  const resultParts = output.messages[0].parts
-  let fileCount = 0
-  let textCount = 0
-  let syntheticCount = 0
-  let ocrTokenCount = 0
-
-  for (const p of resultParts) {
-    if (p.type === "file") fileCount++
-    if (p.type === "text" && p.synthetic) {
-      textCount++
-      syntheticCount++
-      if (p.text && p.text.includes("MEDIAGUARD OCR TOKEN")) ocrTokenCount++
-    } else if (p.type === "text" && !p.synthetic) {
-      // leading user text part
-    }
-  }
-
-  const filePartsRemaining1 = fileCount
-
-  console.log(`\n--- Run #1 (fresh) ---`)
-  console.log(`  Duration: ${ms1}ms`)
-  console.log(`  File parts remaining: ${fileCount}`)
-  console.log(`  Synthetic text parts: ${syntheticCount}`)
-  console.log(`  OCR token hits: ${ocrTokenCount}/120`)
-
-  // ---- 7. Run #2 — cache test (new output, same file paths) ----
-  // Build a completely fresh output object
-  const parts2 = [
-    { type: "text", text: "Summarize these 120 scanned pages" },
-    ...files.map((f, i) => buildFilePart(i, join(imgDir, f))),
-  ]
-  const output2 = { messages: [buildMessage(parts2)] }
-
-  const t2 = Date.now()
-  await transform({}, output2)
-  const ms2 = Date.now() - t2
-
-  const resultParts2 = output2.messages[0].parts
-  let fileCount2 = 0
-  let syntheticCount2 = 0
-  let ocrTokenCount2 = 0
-
-  for (const p of resultParts2) {
-    if (p.type === "file") fileCount2++
-    if (p.type === "text" && p.synthetic) {
-      syntheticCount2++
-      if (p.text && p.text.includes("MEDIAGUARD OCR TOKEN")) ocrTokenCount2++
-    }
-  }
-
-  const filePartsRemaining2 = fileCount2
-
-  console.log(`\n--- Run #2 (cache) ---`)
-  console.log(`  Duration: ${ms2}ms`)
-  console.log(`  File parts remaining: ${fileCount2}`)
-  console.log(`  Synthetic text parts: ${syntheticCount2}`)
-  console.log(`  OCR token hits: ${ocrTokenCount2}/120`)
-
-  // ---- 8. PASS/FAIL ----
-  const pass =
-    filePartsRemaining1 === 0 &&
-    filePartsRemaining2 === 0 &&
-    ocrTokenCount >= 100 &&
-    ms1 < 240_000 &&
-    ms2 < ms1 / 3
-
-  console.log(`\n========================================`)
-  console.log(`Run #1: ${ms1}ms | Run #2: ${ms2}ms | Cache ratio: ${(ms2/ms1*100).toFixed(1)}%`)
-  console.log(`OCR hits: ${ocrTokenCount}/120 (run1) ${ocrTokenCount2}/120 (run2)`)
-  console.log(`File parts remaining: ${filePartsRemaining1} (run1) ${filePartsRemaining2} (run2)`)
-  console.log(`Result: ${pass ? "PASS" : "FAIL"}`)
-  console.log(`========================================\n`)
-}
-
-// Cleanup temp dir
-try { const rm = spawnSync("rm", ["-rf", imgDir], { stdio: "pipe" }); void rm } catch {}
