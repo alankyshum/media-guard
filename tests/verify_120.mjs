@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // Attachment-manifest regression test.
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -19,6 +19,26 @@ try {
     { id: "remote-1", type: "file", filename: "remote.jpg", mime: "image/jpeg", url: "https://example.invalid/remote.jpg" },
   ] }] }
   const hooks = await MediaGuardPlugin({}, {})
+  if (typeof hooks["chat.message"] !== "function" || typeof hooks["experimental.chat.messages.transform"] !== "function") throw new Error("media hooks were not registered")
+
+  const chatMessage = { parts: [
+    { id: "chat-jpg", sessionID: "session-1", messageID: "message-1", type: "file", filename: "telegram/photo_2024-01-01_12-00-00.jpg", mime: "IMAGE/JPEG", url: data.replace("image/png", "image/jpeg") },
+    { id: "chat-text", type: "text", text: "after media" },
+  ] }
+  await hooks["chat.message"]({}, chatMessage)
+  if (chatMessage.parts[0].type !== "text" || !chatMessage.parts[0].synthetic) throw new Error("chat.message did not transform data URL")
+  if (chatMessage.parts[0].id !== "chat-jpg" || chatMessage.parts[0].sessionID !== "session-1" || chatMessage.parts[0].messageID !== "message-1") throw new Error("chat.message identity was not preserved")
+  const chatRecord = JSON.parse(chatMessage.parts[0].text.split("\n", 2)[1])
+  if (chatRecord.filename !== "photo_2024-01-01_12-00-00.jpg" || chatRecord.source !== "data-url" || chatRecord.mime !== "image/jpeg") throw new Error("chat.message JPG manifest is incorrect")
+  const parameterized = { parts: [{ id: "parameterized", type: "file", filename: "parameterized.png", mime: "  IMAGE/PNG ; charset=binary ", url: data }] }
+  await hooks["chat.message"]({}, parameterized)
+  if (parameterized.parts[0].type !== "text" || !parameterized.parts[0].synthetic) throw new Error("parameterized MIME was not intercepted")
+  const parameterizedRecord = JSON.parse(parameterized.parts[0].text.split("\n", 2)[1])
+  if (parameterizedRecord.mime !== "image/png" || parameterizedRecord.media_kind !== "image") throw new Error("parameterized MIME was not canonicalized")
+  const noMatching = { parts: [{ id: "plain", type: "text", text: "unchanged" }] }
+  await hooks["chat.message"]({}, noMatching)
+  if (noMatching.parts[0].text !== "unchanged") throw new Error("chat.message changed output without raw media")
+
   await hooks["experimental.chat.messages.transform"]({}, output)
   const parts = output.messages[0].parts
   if (parts[0].text !== "intent" || parts.slice(1).some(p => p.type !== "text" || !p.synthetic)) throw new Error("parts not transformed")
@@ -62,6 +82,14 @@ try {
   const independentGood = JSON.parse(independent.messages[0].parts[0].text.split("\n", 2)[1])
   const independentBad = JSON.parse(independent.messages[0].parts[1].text.split("\n", 2)[1])
   if (independentGood.source !== "data-url" || independentBad.source !== "error" || independentBad.path !== null) throw new Error("per-file manifests incorrect")
+
+  const chatFailure = { parts: [
+    { id: "failure", type: "file", filename: "failure.jpg", mime: "image/jpeg", url: "data:image/jpeg;base64,not-valid!" },
+  ] }
+  await hooks["chat.message"]({}, chatFailure)
+  if (chatFailure.parts[0].type !== "text" || !chatFailure.parts[0].synthetic) throw new Error("chat.message failure was not sanitized")
+  const failureRecord = JSON.parse(chatFailure.parts[0].text.split("\n", 2)[1])
+  if (failureRecord.source !== "error" || failureRecord.path !== null || "url" in failureRecord) throw new Error("chat.message failure leaked raw media")
   const limited = await MediaGuardPlugin({}, { maxMaterializedBytes: 1 })
   const oversized = { messages: [{ parts: [{ id: "oversized", type: "file", filename: "x", mime: "image/png", url: data }] }] }
   await limited["experimental.chat.messages.transform"]({}, oversized)
@@ -73,6 +101,23 @@ try {
   ] }] }
   await countLimited["experimental.chat.messages.transform"]({}, tooMany)
   if (tooMany.messages[0].parts.some(p => p.type !== "text")) throw new Error("file-count limit did not sanitize failure")
+  const multiDir = join(dir, "multi-materialization")
+  const multiLimited = await MediaGuardPlugin({}, { maxFilesPerTransform: 2, materializationDir: multiDir })
+  const multiTooMany = { messages: [
+    { parts: [{ id: "multi-one", type: "file", filename: "one.png", mime: "image/png", url: data }] },
+    { parts: [{ id: "multi-two", type: "file", filename: "two.png", mime: "image/png", url: data }, { id: "multi-three", type: "file", filename: "three.png", mime: "image/png", url: data }] },
+  ] }
+  await multiLimited["experimental.chat.messages.transform"]({}, multiTooMany)
+  if (multiTooMany.messages.flatMap(message => message.parts).some(part => part.type !== "text" || !part.synthetic)) throw new Error("multi-message file-count limit did not sanitize all matches")
+  if (existsSync(multiDir) && readdirSync(multiDir).length !== 0) throw new Error("multi-message preflight staged files or left side effects")
+  const chatLimited = await MediaGuardPlugin({}, { maxFilesPerTransform: 1, materializationDir: join(dir, "chat-limit") })
+  const chatTooMany = { parts: [
+    { id: "chat-one", type: "file", filename: "one.png", mime: "image/png", url: data },
+    { id: "chat-two", type: "file", filename: "two.png", mime: "image/png", url: data },
+  ] }
+  await chatLimited["chat.message"]({}, chatTooMany)
+  if (chatTooMany.parts.some(part => part.type !== "text" || !part.synthetic)) throw new Error("chat.message file-count preflight did not sanitize all matches")
+  if (existsSync(join(dir, "chat-limit")) && readdirSync(join(dir, "chat-limit")).length !== 0) throw new Error("chat.message preflight staged files or left side effects")
   const totalLimited = await MediaGuardPlugin({}, { maxTotalMaterializedBytes: 5 })
   const tooMuchTotal = { messages: [{ parts: [
     { id: "total-one", type: "file", filename: "x", mime: "image/png", url: data },

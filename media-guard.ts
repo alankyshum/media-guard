@@ -1,7 +1,7 @@
 // Materialize attachments. Never inspect media content beyond staging/hash bytes.
 import type { Plugin } from "@opencode-ai/plugin"
 import { createHash } from "node:crypto"
-import { accessSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, closeSync, unlinkSync, writeSync, writeFileSync, constants as fsConstants } from "node:fs"
+import { accessSync, appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, closeSync, unlinkSync, writeSync, writeFileSync, constants as fsConstants } from "node:fs"
 import { basename, dirname, extname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
@@ -36,8 +36,14 @@ function limits(opts: Options): Limits {
     maxTotalMaterializedBytes: positive(opts.maxTotalMaterializedBytes, positive(workspace.maxTotalMaterializedBytes, FALLBACKS.maxTotalMaterializedBytes)),
   }
 }
-function matchesMime(mime: string, patterns: string[]): boolean { return patterns.some(p => p === mime || (p.endsWith("/*") && mime.startsWith(p.slice(0, -1)))) }
-function mediaKind(mime: string): string { return mime === "application/pdf" ? "pdf" : mime.startsWith("image/") ? "image" : mime.startsWith("audio/") ? "audio" : mime.startsWith("video/") ? "video" : "file" }
+function canonicalMime(mime: string): string {
+  return mime.split(";", 1)[0].trim().toLowerCase()
+}
+function matchesMime(mime: string, patterns: string[]): boolean {
+  const normalized = canonicalMime(mime)
+  return patterns.some(pattern => { const p = canonicalMime(pattern); return p === normalized || (p.endsWith("/*") && normalized.startsWith(p.slice(0, -1))) })
+}
+function mediaKind(mime: string): string { const normalized = canonicalMime(mime); return normalized === "application/pdf" ? "pdf" : normalized.startsWith("image/") ? "image" : normalized.startsWith("audio/") ? "audio" : normalized.startsWith("video/") ? "video" : "file" }
 function safeName(value: unknown): string {
   const name = basename(typeof value === "string" ? value : "attachment").replace(/[\u0000-\u001f\u007f/\\]/g, "_").replace(/[^A-Za-z0-9._ -]/g, "_").trim()
   return name && name !== "." && name !== ".." ? name : "attachment"
@@ -65,7 +71,19 @@ function safeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
   return message.replace(/(?:[A-Za-z]:)?\/[^\s'"`]+/g, "local source")
 }
-function extension(part: any, mime: string): string { return extname(safeName(part?.filename)) || ({ "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf" } as Record<string, string>)[mime] || ".bin" }
+function diagnosticLog(dir: string, hook: string, parts: any[], error?: unknown): void {
+  try {
+    const record = {
+      timestamp: new Date().toISOString(),
+      hook,
+      partCount: parts.length,
+      parts: parts.map(part => ({ type: part?.type, mime: part?.mime })),
+      ...(error ? { error: { message: safeError(error), stack: error instanceof Error ? error.stack : String(error) } } : {}),
+    }
+    appendFileSync(join(dir, "media-guard.log"), `${JSON.stringify(record)}\n`, { mode: 0o600 })
+  } catch {}
+}
+function extension(part: any, mime: string): string { return extname(safeName(part?.filename)) || ({ "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf" } as Record<string, string>)[canonicalMime(mime)] || ".bin" }
 function writeAll(fd: number, bytes: Buffer): void {
   let offset = 0
   while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset)
@@ -135,39 +153,75 @@ async function materialize(part: any, mime: string, dir: string, max: number, re
 function identity(part: any): Record<string, unknown> { return Object.fromEntries(["id", "sessionID", "messageID"].filter(k => part?.[k] !== undefined).map(k => [k, part[k]])) }
 function isMatching(part: any, patterns: string[]): boolean { return part?.type === "file" && typeof part.mime === "string" && matchesMime(part.mime, patterns) }
 function errorPart(part: any, message: string): any {
-  const mime = typeof part?.mime === "string" ? part.mime : "application/octet-stream"
+  const mime = typeof part?.mime === "string" ? canonicalMime(part.mime) : "application/octet-stream"
   const record = { schema_version: 1, filename: safeName(part?.filename), path: null, mime, media_kind: mediaKind(mime), size: null, sha256: null, source: "error", error: safeError(message) }
   return { ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true }
 }
 
 export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => {
   const configured = limits(opts); const patterns = opts.mimes ?? DEFAULT_MIMES; const dir = privateDir(opts.materializationDir ?? DEFAULT_DIR)
-  return { "experimental.chat.messages.transform": async (_input: any, output: any) => {
+  const replaceMatches = (parts: any[], message: string): void => {
+    const snapshot = parts.slice()
+    parts.splice(0, parts.length, ...snapshot.map(part => isMatching(part, patterns) ? errorPart(part, message) : part))
+  }
+  const transformParts = async (parts: any[], state = { files: 0, total: 0 }): Promise<void> => {
+    const snapshot = parts.slice()
+    const matches = snapshot.filter(part => isMatching(part, patterns))
+    if (state.files + matches.length > configured.maxFilesPerTransform) {
+      const message = `transform has more than maxFilesPerTransform (${configured.maxFilesPerTransform}) files`
+      replaceMatches(parts, message)
+      return
+    }
+    state.files += matches.length
+    const transformed: any[] = []
+    for (const part of snapshot) {
+      if (!isMatching(part, patterns)) { transformed.push(part); continue }
+      try {
+        const mime = canonicalMime(part.mime)
+        const staged = await materialize(part, mime, dir, configured.maxMaterializedBytes, configured.maxTotalMaterializedBytes - state.total)
+        state.total += staged.size ?? 0
+        const record = { schema_version: 1, filename: safeName(part.filename), path: staged.path, mime, media_kind: mediaKind(mime), size: staged.size, sha256: staged.sha256, source: staged.source, ...(staged.error ? { error: staged.error } : {}) }
+        transformed.push({ ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true })
+      } catch (error) { diagnosticLog(dir, "transformParts.error", [part], error); transformed.push(errorPart(part, error)) }
+    }
+    parts.splice(0, parts.length, ...transformed)
+  }
+  const transformMessages = async (output: any): Promise<void> => {
     const snapshots = new Map<any, any[]>(); const messages = Array.isArray(output?.messages) ? output.messages : []
+    const state = { files: 0, total: 0 }
+    const receivedParts = messages.flatMap(message => Array.isArray(message?.parts) ? message.parts : [])
+    diagnosticLog(dir, "experimental.chat.messages.transform", receivedParts)
     try {
       for (const message of messages) if (Array.isArray(message?.parts)) snapshots.set(message, message.parts.slice())
-      const fileMatches = messages.flatMap((m: any) => Array.isArray(m?.parts) ? m.parts.filter((p: any) => p?.type === "file" && typeof p.mime === "string" && matchesMime(p.mime, patterns)) : [])
-      if (fileMatches.length > configured.maxFilesPerTransform) throw new Error(`transform has more than maxFilesPerTransform (${configured.maxFilesPerTransform}) files`)
-      let total = 0
+      const totalMatches = [...snapshots.values()].reduce((count, parts) => count + parts.filter(part => isMatching(part, patterns)).length, 0)
+      if (totalMatches > configured.maxFilesPerTransform) {
+        const message = `transform has more than maxFilesPerTransform (${configured.maxFilesPerTransform}) files`
+        for (const [target, parts] of snapshots) target.parts = parts.map(part => isMatching(part, patterns) ? errorPart(part, message) : part)
+        return
+      }
       for (const message of messages) {
         if (!Array.isArray(message?.parts)) continue; snapshots.set(message, message.parts.slice())
-        const transformed: any[] = []
-        for (const part of message.parts) {
-          if (!isMatching(part, patterns)) { transformed.push(part); continue }
-          try {
-            const staged = await materialize(part, part.mime, dir, configured.maxMaterializedBytes, configured.maxTotalMaterializedBytes - total)
-            total += staged.size ?? 0
-            const record = { schema_version: 1, filename: safeName(part.filename), path: staged.path, mime: part.mime, media_kind: mediaKind(part.mime), size: staged.size, sha256: staged.sha256, source: staged.source, ...(staged.error ? { error: staged.error } : {}) }
-            transformed.push({ ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true })
-          } catch (error) {
-            transformed.push(errorPart(part, error))
-          }
-        }
-        message.parts = transformed
+        await transformParts(message.parts, state)
       }
     } catch (error) {
+      diagnosticLog(dir, "experimental.chat.messages.transform.error", receivedParts, error)
       console.error("[media-guard] transform failed:", safeError(error))
       for (const [message, parts] of snapshots) message.parts = parts.map(part => isMatching(part, patterns) ? errorPart(part, error) : part)
     }
-  } }
+  }
+  const transformChatMessage = async (_input: any, output: any): Promise<void> => {
+    const parts = Array.isArray(output?.parts) ? output.parts : null
+    diagnosticLog(dir, "chat.message", parts ?? [])
+    if (!parts) return
+    const snapshot = parts.slice()
+    try { await transformParts(parts) }
+    catch (error) {
+      diagnosticLog(dir, "chat.message.error", parts, error)
+      console.error("[media-guard] chat.message transform failed:", safeError(error))
+      parts.splice(0, parts.length, ...snapshot.map(part => isMatching(part, patterns) ? errorPart(part, error) : part))
+    }
+  }
+  return { "chat.message": transformChatMessage, "experimental.chat.messages.transform": async (_input: any, output: any) => transformMessages(output) }
 }
+
+export default MediaGuardPlugin
