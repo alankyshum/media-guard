@@ -159,17 +159,16 @@ function errorPart(part: any, message: string): any {
 }
 
 type Kind = "pdf" | "image" | "audio" | "video" | "text" | "archive" | "other"
-type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; nativeKinds: string[]; nativeKindsConfigured: boolean; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number }
+type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number }
 type Extractor = (path: string, timeoutMs: number) => Promise<string>
 export type MediaPreprocessOptions = Partial<PreprocessSettings> & { cacheDir?: string; extractors?: Partial<Record<Kind, Extractor>> }
 
-const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], nativeKinds: [], nativeKindsConfigured: false, maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200 }
+const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200 }
 export const MARKERS = {
   extracted: "[media-preprocess extracted:",
   archive: "[media-preprocess archive:",
   archiveFailed: "[media-preprocess archive failed:",
   failed: "[media-preprocess failed:",
-  nativeSkipped: "[media-preprocess native-skip:",
   uncertain: "[media-preprocess uncertain:",
   autoExtracted: "[media-preprocess auto-extracted:",
   needsAgent: "[media-preprocess needs-agent:",
@@ -186,7 +185,6 @@ function workspaceConfig(): Partial<PreprocessSettings> {
     }
     const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
     const enabled = inline("enabledKinds"); if (enabled) out.enabledKinds = enabled
-    const native = inline("nativeKinds"); if (native) out.nativeKinds = native
     return out
   } catch { return {} }
 }
@@ -197,63 +195,12 @@ function settings(opts: MediaPreprocessOptions): PreprocessSettings {
     timeoutMs: positive(opts.timeoutMs, positive(w.timeoutMs, PREPROCESS_FALLBACKS.timeoutMs)),
     maxFilesPerTransform: positive(opts.maxFilesPerTransform, positive(w.maxFilesPerTransform, PREPROCESS_FALLBACKS.maxFilesPerTransform)),
     enabledKinds: Array.isArray(opts.enabledKinds) ? opts.enabledKinds : (w.enabledKinds ?? PREPROCESS_FALLBACKS.enabledKinds),
-    nativeKinds: Array.isArray(opts.nativeKinds) ? opts.nativeKinds : (w.nativeKinds ?? PREPROCESS_FALLBACKS.nativeKinds),
-    nativeKindsConfigured: Array.isArray(opts.nativeKinds) || Array.isArray(w.nativeKinds),
     maxArchiveEntries: positive(opts.maxArchiveEntries, positive(w.maxArchiveEntries, PREPROCESS_FALLBACKS.maxArchiveEntries)),
     maxArchiveBytes: positive(opts.maxArchiveBytes, positive(w.maxArchiveBytes, PREPROCESS_FALLBACKS.maxArchiveBytes)),
     maxCompressionRatio: positive(opts.maxCompressionRatio, positive(w.maxCompressionRatio, PREPROCESS_FALLBACKS.maxCompressionRatio)),
   }
 }
 
-// JSONC parser which removes comments only outside quoted strings. In particular,
-// URLs such as http://127.0.0.1:8765/v1 remain untouched.
-export function stripJsoncComments(source: string): string {
-  let out = "", quote = false, escaped = false, line = false, block = false
-  for (let i = 0; i < source.length; i++) { const c = source[i], n = source[i + 1]
-    if (line) { if (c === "\n") { line = false; out += c }; continue }
-    if (block) { if (c === "*" && n === "/") { block = false; i++ }; continue }
-    if (quote) { out += c; if (escaped) escaped = false; else if (c === "\\") escaped = true; else if (c === '"') quote = false; continue }
-    if (c === '"') { quote = true; out += c } else if (c === "/" && n === "/") { line = true; i++ } else if (c === "/" && n === "*") { block = true; i++ } else out += c
-  }
-  // JSONC also permits trailing commas. Remove them only outside strings;
-  // comments have already been removed above, so whitespace is sufficient.
-  let cleaned = "", quoted = false, escapedQuote = false
-  for (let i = 0; i < out.length; i++) { const c = out[i]
-    if (quoted) { cleaned += c; if (escapedQuote) escapedQuote = false; else if (c === "\\") escapedQuote = true; else if (c === '"') quoted = false; continue }
-    if (c === '"') { quoted = true; cleaned += c; continue }
-    if (c === ",") { let j = i + 1; while (/\s/.test(out[j] ?? "")) j++; if (out[j] === "]" || out[j] === "}") continue }
-    cleaned += c
-  }
-  return cleaned
-}
-let modelConfigCache: any | null | undefined
-function modelConfig(): any {
-  if (modelConfigCache !== undefined) return modelConfigCache
-  try { modelConfigCache = JSON.parse(stripJsoncComments(readFileSync(join(REPO_ROOT, "config/opencode/opencode.jsonc"), "utf8"))); return modelConfigCache } catch { modelConfigCache = null; return null }
-}
-type ModelInfo = { modalities?: { input?: unknown } }
-function modalitiesForModel(input: any, synthetic?: Record<string, ModelInfo>): Set<string> | null {
-  try {
-    const direct = input?.model?.modalities?.input
-    if (Array.isArray(direct)) return new Set(direct.filter(x => typeof x === "string"))
-    const provider = input?.model?.providerID, id = input?.model?.modelID
-    if (typeof provider !== "string" || typeof id !== "string") return null
-    const models: Record<string, ModelInfo> | undefined = synthetic ?? modelConfig()?.provider?.[provider]?.models
-    if (!models) return null
-    const chain = id.startsWith("[") && id.endsWith("]")
-    const members = chain ? id.slice(1, -1).split(",").map(x => x.trim()).filter(Boolean) : [id]
-    // Conservative AND semantics: every failover member must accept the kind.
-    // Do not fall back to a chain's aggregate declaration for an individual
-    // member: an unknown/weaker failover must force extraction.
-    const infos = chain ? members.map(member => models[member]) : [models[id]]
-    if (infos.some(x => !x || !Array.isArray(x.modalities?.input))) return null
-    const kinds = ["image", "audio", "video", "pdf", "text", "archive"]
-    return new Set(kinds.filter(kind => infos.every(x => (x.modalities!.input as unknown[]).includes(kind))))
-  } catch { return null }
-}
-export function detectedNativeKinds(input: any, syntheticModelMap?: Record<string, ModelInfo>): string[] | null {
-  const modalities = modalitiesForModel(input, syntheticModelMap); return modalities ? [...modalities] : null
-}
 function sh(value: string): string { return `'${value.replace(/'/g, `'"'"'`)}'` }
 function run(command: string, timeoutMs: number): Promise<string> {
   const out = join(realpathSync(tmpdir()), `opencode-media-preprocess-${process.pid}-${Math.random().toString(16).slice(2)}.out`)
@@ -396,13 +343,12 @@ async function augmentArchive(part: any, manifest: any, cfg: PreprocessSettings,
     return { ...part, text: `${part.text}\n${block.join("\n")}` }
   } catch (e) { return { ...part, text: `${part.text}\n${MARKERS.archiveFailed} reason=${safeError(e)}]` } }
 }
-function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: Record<Kind, Extractor>, nativeKinds: Set<string>): Promise<any> {
+function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: Record<Kind, Extractor>): Promise<any> {
   const manifest = parseManifest(part); if (!manifest || !manifest.path || Object.prototype.hasOwnProperty.call(manifest, "error") || processed(part.text)) return Promise.resolve(part)
   const kind = classify(manifest.path, manifest.mime) === "other" ? manifest.media_kind as Kind : classify(manifest.path, manifest.mime)
   if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
   if (kind === "archive") return augmentArchive(part, manifest, cfg, cache, extractors)
   if (!["pdf", "image", "audio", "video"].includes(kind)) return Promise.resolve(part)
-  if (nativeKinds.has(kind)) return Promise.resolve({ ...part, text: `${part.text}\n${MARKERS.nativeSkipped} kind=${kind} reason=model accepts ${kind} input natively]` })
   return (async () => { try { localPath(manifest.path); const text = await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined); const clipped = text.slice(0, cfg.maxExtractedChars), truncated = clipped.length < text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`; return { ...part, text: `${part.text}\n${label}${clipped.trim() ? `\n${clipped}` : ""}` } } catch (e) { return { ...part, text: `${part.text}\n${MARKERS.failed} kind=${kind} reason=${safeError(e)}]` } } })()
 }
 function processed(text: string): boolean { return Object.values(MARKERS).some(marker => text.includes(marker)) }
@@ -413,12 +359,7 @@ export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => 
   const preprocessConfig = settings(opts)
   const preprocessCache = privateDir(opts.cacheDir ?? join(realpathSync(tmpdir()), "opencode-media-preprocess"), "cache")
   const preprocessExtractors = { ...defaults, ...(opts.extractors ?? {}) } as Record<Kind, Extractor>
-  const nativeFor = (input: any): Set<string> => {
-    if (preprocessConfig.nativeKindsConfigured) return new Set(preprocessConfig.nativeKinds)
-    return new Set(detectedNativeKinds(input) ?? [])
-  }
-  const preprocessParts = async (parts: any[], input: any, state = { count: 0 }): Promise<void> => {
-    const nativeKinds = nativeFor(input)
+  const preprocessParts = async (parts: any[], state = { count: 0 }): Promise<void> => {
     const snapshot = parts.slice()
     try {
       const result: any[] = []
@@ -426,7 +367,7 @@ export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => 
         const manifest = parseManifest(part)
         const eligible = !!manifest && !!manifest.path && !Object.prototype.hasOwnProperty.call(manifest, "error") && preprocessConfig.enabledKinds.includes(manifest.media_kind) && !processed(part.text)
         if (eligible && state.count++ >= preprocessConfig.maxFilesPerTransform) result.push({ ...part, text: `${part.text}\n${MARKERS.failed} kind=${manifest.media_kind} reason=maxFilesPerTransform]` })
-        else result.push(await augment(part, preprocessConfig, preprocessCache, preprocessExtractors, nativeKinds))
+        else result.push(await augment(part, preprocessConfig, preprocessCache, preprocessExtractors))
       }
       parts.splice(0, parts.length, ...result)
     } catch (error) {
@@ -477,7 +418,7 @@ export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => 
       for (const message of messages) {
         if (!Array.isArray(message?.parts)) continue; snapshots.set(message, message.parts.slice())
         await transformParts(message.parts, state)
-        await preprocessParts(message.parts, input, preprocessState)
+        await preprocessParts(message.parts, preprocessState)
       }
     } catch (error) {
       diagnosticLog(dir, "experimental.chat.messages.transform.error", receivedParts, error)
@@ -490,7 +431,7 @@ export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => 
     diagnosticLog(dir, "chat.message", parts ?? [])
     if (!parts) return
     const snapshot = parts.slice()
-    try { await transformParts(parts); await preprocessParts(parts, _input) }
+    try { await transformParts(parts); await preprocessParts(parts) }
     catch (error) {
       diagnosticLog(dir, "chat.message.error", parts, error)
       console.error("[media-guard] chat.message transform failed:", safeError(error))

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { createHash } from "node:crypto"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { detectedNativeKinds, MARKERS, MediaGuardPlugin, stripJsoncComments } from "../media-guard.ts"
+import { MARKERS, MediaGuardPlugin } from "../media-guard.ts"
 
 const root = mkdtempSync(join(tmpdir(), "media-preprocess-test-"))
 const cache = join(root, "cache")
@@ -18,9 +18,6 @@ const part = (record: any, id = "p1") => ({ id, sessionID: "s1", messageID: "m1"
 const assert = (condition: unknown, message: string) => { if (!condition) throw new Error(message) }
 
 try {
-  const jsonc = JSON.parse(stripJsoncComments(readFileSync(join(import.meta.dir, "../../../config/opencode/opencode.jsonc"), "utf8")))
-  assert(jsonc.provider["open-llm-proxy"].options.baseURL === "http://127.0.0.1:8765/v1", "JSONC parser corrupted URL string")
-
   const hooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard"), cacheDir: cache, extractors: {
     pdf: async () => "extracted words",
     image: async () => "image words",
@@ -97,7 +94,7 @@ try {
   const archivePath = join(root, "bundle.zip")
   assert(Bun.spawnSync(["zip", "-q", "-r", archivePath, "."], { cwd: archiveDir }).exitCode === 0, "could not create zip")
   const archiveSha = createHash("sha256").update(readFileSync(archivePath)).digest("hex")
-  const archiveHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-archive"), cacheDir: join(root, "archive-cache"), nativeKinds: ["image"], enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], extractors: { pdf: async () => "pdf", audio: async () => "audio", video: async () => "video" } })
+  const archiveHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-archive"), cacheDir: join(root, "archive-cache"), enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], extractors: { pdf: async () => "pdf", audio: async () => "audio", video: async () => "video" } })
   const archivePart = part({ filename: "bundle.zip", path: archivePath, mime: "application/zip", media_kind: "archive", sha256: archiveSha }, "archive")
   const archiveContainer = { parts: [archivePart] }
   await archiveHooks["chat.message"]!({}, archiveContainer)
@@ -191,58 +188,15 @@ try {
   }
   assert(markerCalls === 0, `centralized marker was re-extracted (${markerCalls})`)
 
-  // Explicit nativeKinds skips only the selected top-level kind.
-  let nativeCalls = 0
-  const nativeHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-native"), cacheDir: join(root, "native-cache"), nativeKinds: ["image"], extractors: {
-    image: async () => { nativeCalls++; return "should not run" },
-    pdf: async () => { nativeCalls++; return "pdf still runs" },
+  // Image extraction is unconditional; model modality declarations do not gate it.
+  let imageCalls = 0
+  const imageHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-image"), cacheDir: join(root, "image-cache"), extractors: {
+    image: async () => { imageCalls++; return "image extracted" },
   } })
-  const nativeImage = part({ ...manifest("image", "/x.png"), mime: "image/png", filename: "x.png" }, "native-image")
-  const nativePdf = part(manifest("pdf", "/x.pdf"), "native-pdf")
-  const nativeContainer = { parts: [nativeImage, nativePdf] }
-  await nativeHooks["chat.message"]!({}, nativeContainer)
-  assert(nativeCalls === 1, `native image was extracted or PDF was skipped (${nativeCalls})`)
-  assert(nativeContainer.parts[0].text.includes("[media-preprocess native-skip: kind=image reason=model accepts image input natively]"), "native-skip marker missing")
-  assert(nativeContainer.parts[1].text.includes("pdf still runs"), "PDF was not extracted with image native")
-
-  // [] is an explicit force-extract override and preserves the old behavior.
-  let defaultCalls = 0
-  const defaultHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-native-default"), cacheDir: join(root, "native-default-cache"), nativeKinds: [], extractors: { image: async () => { defaultCalls++; return "image extracted" } } })
-  const defaultImage = part({ ...manifest("image", "/x.png"), mime: "image/png", filename: "x.png", sha256: "e".repeat(64) }, "default-image")
-  const defaultContainer = { parts: [defaultImage] }
-  await defaultHooks["chat.message"]!({}, defaultContainer)
-  assert(defaultCalls === 1 && defaultContainer.parts[0].text.includes("image extracted"), "empty nativeKinds did not extract image")
-
-  // native-skip is terminal through both hook paths via processed().
-  let skipCalls = 0
-  const idempotentNative = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-native-idempotent"), cacheDir: join(root, "native-idempotent-cache"), nativeKinds: ["image"], extractors: { image: async () => { skipCalls++; return "must not run" } } })
-  const alreadySkipped = part({ ...manifest("image", "/x.png"), mime: "image/png", filename: "x.png", sha256: "f".repeat(64) }, "already-skipped")
-  alreadySkipped.text += `\n${MARKERS.nativeSkipped} kind=image reason=model accepts image input natively]`
-  const alreadyText = alreadySkipped.text
-  await idempotentNative["chat.message"]!({}, { parts: [alreadySkipped] })
-  const transformAlready = { messages: [{ parts: [alreadySkipped] }] }
-  await idempotentNative["experimental.chat.messages.transform"]!({}, transformAlready)
-  assert(skipCalls === 0 && alreadySkipped.text === alreadyText, "native-skip marker was not idempotent")
-
-  // A chain is native only when every member declares the modality.
-  const chainInput = { model: { providerID: "synthetic", modelID: "[strong,weaker]" } }
-  assert(detectedNativeKinds(chainInput, {
-    strong: { modalities: { input: ["text", "image"] } },
-    weaker: { modalities: { input: ["text"] } },
-  })?.includes("image") === false, "chain incorrectly treated image as native")
-  assert(detectedNativeKinds(chainInput, {
-    strong: { modalities: { input: ["text", "image"] } },
-    weaker: { modalities: { input: ["text", "image"] } },
-  })?.includes("image") === true, "all-image chain was not treated as native")
-  assert(detectedNativeKinds({ model: { providerID: "missing", modelID: "unknown" } }) === null, "malformed model info did not fail detection")
-
-  // Detection failure defaults to extraction when no explicit nativeKinds is configured.
-  let detectionCalls = 0
-  const detectionFallback = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-detection-fallback"), cacheDir: join(root, "detection-fallback-cache"), nativeKinds: [], extractors: { image: async () => { detectionCalls++; return "fallback extraction" } } })
-  const detectionPart = part({ ...manifest("image", "/x.png"), mime: "image/png", filename: "x.png", sha256: "1".repeat(64) }, "detection-fallback")
-  const detectionContainer = { parts: [detectionPart] }
-  await detectionFallback["chat.message"]!({ model: { providerID: "missing", modelID: "unknown" } }, detectionContainer)
-  assert(detectionCalls === 1 && !detectionContainer.parts[0].text.includes(MARKERS.nativeSkipped), "detection failure skipped instead of extracting")
+  const imagePart = part({ ...manifest("image", "/x.png"), mime: "image/png", filename: "x.png" }, "image-unconditional")
+  const imageContainer = { parts: [imagePart] }
+  await imageHooks["chat.message"]!({}, imageContainer)
+  assert(imageCalls === 1 && imageContainer.parts[0].text.includes("image extracted"), "image extraction was gated")
 
   // Expansion directories are private, not merely the expansion root.
   const nestedInput = join(root, "nested-input"); mkdirSync(join(nestedInput, "one", "two"), { recursive: true }); writeFileSync(join(nestedInput, "one", "two", "file.txt"), "nested")

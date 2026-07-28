@@ -21,8 +21,8 @@ const run = (argv: string[], options: any = {}) => {
 const partsText = (output: any) => output.parts.filter((p: any) => typeof p.text === "string").map((p: any) => p.text).join("\n")
 const attachment = (id: string, filename: string, mime: string, path: string) => ({ id, type: "file", filename, mime, source: { path } })
 
-async function realPipeline(file: any, cacheName: string, nativeKinds: string[] = []): Promise<string> {
-  const plugin = await MediaGuardPlugin({}, { materializationDir: join(root, `${cacheName}-guard`), cacheDir: join(root, `${cacheName}-preprocess`), timeoutMs: 300000, nativeKinds })
+async function realPipeline(file: any, cacheName: string): Promise<string> {
+  const plugin = await MediaGuardPlugin({}, { materializationDir: join(root, `${cacheName}-guard`), cacheDir: join(root, `${cacheName}-preprocess`), timeoutMs: 300000 })
   const output = { parts: [{ id: "u1", type: "text", text: "what is the total on this invoice?" }, file] }
   await plugin["chat.message"]!({}, output)
   return partsText(output)
@@ -56,9 +56,9 @@ d=fitz.open(); p=d.new_page(width=600,height=130); p.insert_text((35,75), 'Invoi
     imageText = await realPipeline(attachment("i1", "invoice.png", "image/png", image), "image")
     assert(imageText.includes("1,234.56") || imageText.includes("1234.56"), `image OCR missing invoice amount: ${imageText}`)
     console.log(`PASS image extracted text: ${JSON.stringify(imageText)}`)
-    const nativeText = await realPipeline(attachment("i2", "invoice.png", "image/png", image), "image-native", ["image"])
-    assert(nativeText.includes("[media-preprocess native-skip: kind=image reason=model accepts image input natively]"), `image native-skip marker missing: ${nativeText}`)
-    console.log("PASS image native-skip marker")
+    const secondImageText = await realPipeline(attachment("i2", "invoice.png", "image/png", image), "image-second")
+    assert(secondImageText.includes("1,234.56") || secondImageText.includes("1234.56"), `second image extraction missing invoice amount: ${secondImageText}`)
+    console.log("PASS image extracted text without modality gating")
   } catch (error) {
     console.warn(`SKIP IMAGE (real local image OCR unavailable): ${error instanceof Error ? error.message : error}`)
   }
