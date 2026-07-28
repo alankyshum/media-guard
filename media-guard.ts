@@ -8,7 +8,7 @@ import { tmpdir } from "node:os"
 
 type Limits = { maxMaterializedBytes: number; maxFilesPerTransform: number; maxTotalMaterializedBytes: number }
 type Options = Partial<Limits> & { mimes?: string[]; materializationDir?: string }
-const DEFAULT_MIMES = ["image/*", "application/pdf", "audio/*", "video/*"]
+const DEFAULT_MIMES = ["image/*", "application/pdf", "audio/*", "video/*", "application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed"]
 const FALLBACKS: Limits = { maxMaterializedBytes: 100 * 1024 * 1024, maxFilesPerTransform: 64, maxTotalMaterializedBytes: 500 * 1024 * 1024 }
 const PLUGIN_PATH = realpathSync(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(dirname(PLUGIN_PATH), "../..")
@@ -43,7 +43,7 @@ function matchesMime(mime: string, patterns: string[]): boolean {
   const normalized = canonicalMime(mime)
   return patterns.some(pattern => { const p = canonicalMime(pattern); return p === normalized || (p.endsWith("/*") && normalized.startsWith(p.slice(0, -1))) })
 }
-function mediaKind(mime: string): string { const normalized = canonicalMime(mime); return normalized === "application/pdf" ? "pdf" : normalized.startsWith("image/") ? "image" : normalized.startsWith("audio/") ? "audio" : normalized.startsWith("video/") ? "video" : "file" }
+function mediaKind(mime: string): string { const normalized = canonicalMime(mime); return normalized === "application/pdf" ? "pdf" : normalized.startsWith("image/") ? "image" : normalized.startsWith("audio/") ? "audio" : normalized.startsWith("video/") ? "video" : ["application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed"].includes(normalized) ? "archive" : "file" }
 function safeName(value: unknown): string {
   const name = basename(typeof value === "string" ? value : "attachment").replace(/[\u0000-\u001f\u007f/\\]/g, "_").replace(/[^A-Za-z0-9._ -]/g, "_").trim()
   return name && name !== "." && name !== ".." ? name : "attachment"
@@ -83,7 +83,7 @@ function diagnosticLog(dir: string, hook: string, parts: any[], error?: unknown)
     appendFileSync(join(dir, "media-guard.log"), `${JSON.stringify(record)}\n`, { mode: 0o600 })
   } catch {}
 }
-function extension(part: any, mime: string): string { return extname(safeName(part?.filename)) || ({ "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf" } as Record<string, string>)[canonicalMime(mime)] || ".bin" }
+function extension(part: any, mime: string): string { return extname(safeName(part?.filename)) || ({ "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf", "application/zip": ".zip", "application/x-zip-compressed": ".zip", "application/gzip": ".tar.gz", "application/x-gzip": ".gz", "application/x-tar": ".tar", "application/x-bzip2": ".bz2", "application/x-xz": ".xz", "application/x-7z-compressed": ".7z", "application/vnd.rar": ".rar", "application/x-rar-compressed": ".rar" } as Record<string, string>)[canonicalMime(mime)] || ".bin" }
 function writeAll(fd: number, bytes: Buffer): void {
   let offset = 0
   while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset)

@@ -35,6 +35,11 @@ Inspection is explicit. Load a relevant skill against the materialized path:
 - images: `image--apple-vision-ocr`
 - PDFs: `tool--pdf`
 - audio/video: `tool--transcribe`
+- archives: `media--guard-playbook` (the preprocess plugin expands them; media guard only stages and hashes them)
+
+Archive MIME types are materialized as `media_kind: archive`, but this plugin never
+opens, lists, extracts, or otherwise inspects archive contents. Expansion and member
+security checks happen in the later `media-preprocess` stage.
 
 ## Verification
 
