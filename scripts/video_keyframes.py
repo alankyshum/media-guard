@@ -68,7 +68,7 @@ def timestamps_for_video(ffmpeg: str, ffprobe: str, video: str, threshold: float
     timestamps = sorted({round(timestamp, 6) for timestamp in timestamps if 0 <= timestamp < duration})
     if not changes:
         count = min(max_frames, max(1, 4 if duration > 3 else 2))
-        timestamps = [0.0] if count == 1 else [round(duration * i / (count - 1), 6) for i in range(count)]
+        timestamps = [0.0] if count == 1 else [round((duration - min(0.1, duration / 10)) * i / (count - 1), 6) for i in range(count)]
     total = len(timestamps)
     return timestamps[:max_frames], total
 
