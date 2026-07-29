@@ -17,6 +17,14 @@ const part = (record: any, id = "p1") => ({ id, sessionID: "s1", messageID: "m1"
   text: `[media-guard attachment manifest]\n${JSON.stringify(record)}` })
 const assert = (condition: unknown, message: string) => { if (!condition) throw new Error(message) }
 
+const source = readFileSync(join(import.meta.dir, "..", "media-guard.ts"), "utf8")
+const materializationParser = source.slice(source.indexOf("function workspaceLimits()"), source.indexOf("function limits("))
+const preprocessingParser = source.slice(source.indexOf("function workspaceConfig()"), source.indexOf("function settings("))
+const materializedKeys = [...materializationParser.matchAll(/^\s*\w+:\s*"([A-Za-z0-9]+)"/gm)].map(match => match[1])
+const extractedKeys = [...preprocessingParser.matchAll(/^\s*([A-Za-z0-9]+):\s*"/gm)].map(match => match[1])
+const documentedKeys = [...readFileSync(join(import.meta.dir, "..", "README.md"), "utf8").matchAll(/^\| `([^`]+)` \|/gm)].map(match => match[1])
+for (const key of [...materializedKeys, ...extractedKeys]) assert(documentedKeys.includes(key), `parser config key is missing from README: ${key}`)
+
 try {
   const hooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard"), cacheDir: cache, extractors: {
     pdf: async () => "extracted words",

@@ -47,7 +47,7 @@ The existing dotfiles runtime supplies these values under `media_guard:` in `con
 | Setting | Default | Meaning |
 |---|---:|---|
 | `maxMaterializedBytes` | `104857600` | Maximum bytes for one staged attachment. |
-| `maxFilesPerTransform` | `64` | Maximum top-level attachments in one transform. |
+| `maxMaterializedFilesPerTransform` | `64` | Maximum top-level attachments in one transform during materialization/guard staging. |
 | `maxTotalMaterializedBytes` | `524288000` | Maximum aggregate staged bytes in one transform. |
 | `maxExtractedChars` | `200000` | Maximum inline extracted characters. |
 | `timeoutMs` | `300000` | Extractor timeout in milliseconds. |
