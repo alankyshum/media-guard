@@ -11,7 +11,7 @@ import { tmpdir } from "node:os"
 import { MediaGuardPlugin } from "../media-guard.ts"
 
 const root = mkdtempSync(join(tmpdir(), "media-pipeline-e2e-"))
-const py = process.env.MEDIA_GUARD_PYTHON ?? Bun.which("python3") ?? (() => { throw new Error("python3 is required; install Python 3 or set MEDIA_GUARD_PYTHON") })()
+const py = process.env.MEDIA_GUARD_PYTHON ?? [join(import.meta.dir, "..", ".venv/bin/python"), join(import.meta.dir, "..", "scripts/.venv/bin/python")].find(existsSync) ?? Bun.which("python3") ?? (() => { throw new Error("python3 is required; install Python 3 or set MEDIA_GUARD_PYTHON") })()
 const assert = (condition: unknown, message: string) => { if (!condition) throw new Error(message) }
 const run = (argv: string[], options: any = {}) => {
   const result = Bun.spawnSync(argv, { ...options, stdout: "pipe", stderr: "pipe" })

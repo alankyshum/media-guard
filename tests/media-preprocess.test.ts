@@ -233,7 +233,7 @@ try {
     '    p.insert_text((310,130),"South Total: $2,900",fontsize=12)',
     'd.save(sys.argv[1])',
   ].join("\n"))
-  const py = process.env.MEDIA_GUARD_PYTHON ?? Bun.which("python3") ?? (() => { throw new Error("python3 is required; install Python 3 or set MEDIA_GUARD_PYTHON") })()
+  const py = process.env.MEDIA_GUARD_PYTHON ?? [join(import.meta.dir, "..", ".venv/bin/python"), join(import.meta.dir, "..", "scripts/.venv/bin/python")].find(existsSync) ?? Bun.which("python3") ?? (() => { throw new Error("python3 is required; install Python 3 or set MEDIA_GUARD_PYTHON") })()
   assert(Bun.spawnSync([py, multiPy, multiPdf]).exitCode === 0 && existsSync(multiPdf), "could not generate multi-column PDF")
   const multiSha = createHash("sha256").update(readFileSync(multiPdf)).digest("hex")
   const multiPdfHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-multi"), cacheDir: join(root, "multi-cache"), extractors: { pdf: async () => "tabular data extracted" } })
