@@ -21,8 +21,13 @@ function workspaceLimits(): Partial<Limits> {
     const text = readFileSync(CONFIG_PATH, "utf8")
     const section = text.match(/^media_guard:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
     const out: Partial<Limits> = {}
-    for (const key of Object.keys(FALLBACKS) as (keyof Limits)[]) {
-      const match = section.match(new RegExp(`^\\s*${key}:\\s*(\\d+)\\s*$`, "m"))
+    const keys: Record<keyof Limits, string> = {
+      maxMaterializedBytes: "maxMaterializedBytes",
+      maxFilesPerTransform: "maxMaterializedFilesPerTransform",
+      maxTotalMaterializedBytes: "maxTotalMaterializedBytes",
+    }
+    for (const key of Object.keys(keys) as (keyof Limits)[]) {
+      const match = section.match(new RegExp(`^\\s*${keys[key]}:\\s*(\\d+)\\s*$`, "m"))
       if (match) out[key] = Number(match[1])
     }
     return out
@@ -182,10 +187,20 @@ const MIME: Record<string, string> = { ".pdf": "application/pdf", ".png": "image
 function workspaceConfig(): Partial<PreprocessSettings> {
   try {
     const text = readFileSync(CONFIG_PATH, "utf8")
-    const section = text.match(/^media_preprocess:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
+    const section = text.match(/^media_guard:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
     const out: Partial<PreprocessSettings> = {}
-    for (const key of ["maxExtractedChars", "timeoutMs", "maxFilesPerTransform", "maxArchiveEntries", "maxArchiveBytes", "maxCompressionRatio", "maxPdfPageImages", "maxVideoKeyframes"] as const) {
-      const m = section.match(new RegExp(`^\\s*${key}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
+    const keys: Record<string, keyof PreprocessSettings> = {
+      maxExtractedChars: "maxExtractedChars",
+      timeoutMs: "timeoutMs",
+      maxExtractedFilesPerTransform: "maxFilesPerTransform",
+      maxArchiveEntries: "maxArchiveEntries",
+      maxArchiveBytes: "maxArchiveBytes",
+      maxCompressionRatio: "maxCompressionRatio",
+      maxPdfPageImages: "maxPdfPageImages",
+      maxVideoKeyframes: "maxVideoKeyframes",
+    }
+    for (const [configKey, key] of Object.entries(keys)) {
+      const m = section.match(new RegExp(`^\\s*${configKey}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
     }
     const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
     const enabled = inline("enabledKinds"); if (enabled) out.enabledKinds = enabled
