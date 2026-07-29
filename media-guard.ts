@@ -397,7 +397,7 @@ function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: 
   const kind = classify(manifest.path, manifest.mime) === "other" ? manifest.media_kind as Kind : classify(manifest.path, manifest.mime)
   if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
   if (kind === "archive") return augmentArchive(part, manifest, cfg, cache, extractors)
-  if (!["pdf", "image", "audio", "video"].includes(kind)) return Promise.resolve(part)
+  if (!["pdf", "image", "audio", "video", "text"].includes(kind)) return Promise.resolve(part)
   return (async () => {
     try {
       localPath(manifest.path); const text = await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined); const clipped = text.slice(0, cfg.maxExtractedChars), truncated = clipped.length < text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`

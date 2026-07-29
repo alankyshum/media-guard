@@ -198,6 +198,24 @@ try {
   await imageHooks["chat.message"]!({}, imageContainer)
   assert(imageCalls === 1 && imageContainer.parts[0].text.includes("image extracted"), "image extraction was gated")
 
+  // Top-level text manifests are extracted by both hook paths and remain idempotent.
+  const textPath = join(root, "top-level.txt")
+  writeFileSync(textPath, "top-level text attachment contents")
+  const textHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-text"), cacheDir: join(root, "text-cache") })
+  const textManifest = { filename: "top-level.txt", path: textPath, mime: "text/plain", media_kind: "text", sha256: createHash("sha256").update(readFileSync(textPath)).digest("hex") }
+  const textChat = { parts: [part(textManifest, "text-chat")] }
+  await textHooks["chat.message"]!({}, textChat)
+  const textChatOnce = textChat.parts[0].text
+  assert(textChatOnce.includes("[media-preprocess extracted: kind=text") && textChatOnce.includes("top-level text attachment contents"), "top-level text was not extracted in chat hook")
+  await textHooks["chat.message"]!({}, textChat)
+  assert(textChat.parts[0].text === textChatOnce, "top-level text chat extraction was not idempotent")
+  const textTransform = { messages: [{ parts: [part(textManifest, "text-transform")] }] }
+  await textHooks["experimental.chat.messages.transform"]!({}, textTransform)
+  const textTransformOnce = textTransform.messages[0].parts[0].text
+  assert(textTransformOnce.includes("[media-preprocess extracted: kind=text") && textTransformOnce.includes("top-level text attachment contents"), "top-level text was not extracted in transform hook")
+  await textHooks["experimental.chat.messages.transform"]!({}, textTransform)
+  assert(textTransform.messages[0].parts[0].text === textTransformOnce, "top-level text transform extraction was not idempotent")
+
   // Expansion directories are private, not merely the expansion root.
   const nestedInput = join(root, "nested-input"); mkdirSync(join(nestedInput, "one", "two"), { recursive: true }); writeFileSync(join(nestedInput, "one", "two", "file.txt"), "nested")
   const nestedDirArchive = join(root, "nested-dir.zip"); assert(Bun.spawnSync(["zip", "-q", "-r", nestedDirArchive, "."], { cwd: nestedInput }).exitCode === 0, "could not create nested directory fixture")
