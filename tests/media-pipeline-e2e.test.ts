@@ -5,7 +5,7 @@
  * cached OCR/Whisper models. No extractors are injected or mocked.
  */
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { MediaGuardPlugin } from "../media-guard.ts"
@@ -35,6 +35,20 @@ d=fitz.open(); p=d.new_page(); p.insert_text((72,100), 'Invoice #INV-2024-001');
   const pdfText = await realPipeline(attachment("f1", "invoice.pdf", "application/pdf", pdf), "pdf")
   assert(pdfText.includes("$1,234.56"), `PDF amount missing from final model text: ${pdfText}`)
   console.log(`PASS PDF extracted text: ${JSON.stringify(pdfText.match(/Invoice #[^\n]+|Total Due[^\n]+/g) ?? pdfText)}`)
+  // PDF page images assertion
+  const pdfCacheDir = join(root, "pdf-preprocess")
+  const pdfDirEntries = readdirSync(pdfCacheDir)
+  const pdfPageDir = pdfDirEntries.find(e => e.includes(".pdfpages"))
+  if (pdfPageDir) {
+    const webpFiles = readdirSync(join(pdfCacheDir, pdfPageDir)).filter(f => f.endsWith(".webp")).sort()
+    assert(webpFiles.length >= 1, `expected at least 1 page image, got ${webpFiles.length}`)
+    const sizes = webpFiles.map(f => statSync(join(pdfCacheDir, pdfPageDir, f)).size)
+    sizes.forEach((s, i) => { assert(s > 0 && s < 500 * 1024, `page ${webpFiles[i]} size ${s} out of range`) })
+    assert(pdfText.includes("[media-preprocess pdf-pages:"), "pdf-pages marker missing in e2e")
+    console.log(`PASS PDF page images: ${webpFiles.length} WebP files, sizes ${sizes.join(", ")} bytes`)
+  } else {
+    console.warn("SKIP PDF page images: .pdfpages cache dir not found in " + pdfCacheDir)
+  }
 
   let audioText = ""
   try {

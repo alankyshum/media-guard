@@ -159,11 +159,11 @@ function errorPart(part: any, message: string): any {
 }
 
 type Kind = "pdf" | "image" | "audio" | "video" | "text" | "archive" | "other"
-type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number }
+type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number; maxPdfPageImages: number }
 type Extractor = (path: string, timeoutMs: number) => Promise<string>
 export type MediaPreprocessOptions = Partial<PreprocessSettings> & { cacheDir?: string; extractors?: Partial<Record<Kind, Extractor>> }
 
-const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200 }
+const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200, maxPdfPageImages: 50 }
 export const MARKERS = {
   extracted: "[media-preprocess extracted:",
   archive: "[media-preprocess archive:",
@@ -172,6 +172,8 @@ export const MARKERS = {
   uncertain: "[media-preprocess uncertain:",
   autoExtracted: "[media-preprocess auto-extracted:",
   needsAgent: "[media-preprocess needs-agent:",
+  pdfPages: "[media-preprocess pdf-pages:",
+  pdfPagesFailed: "[media-preprocess pdf-pages-failed:",
 } as const
 const MIME: Record<string, string> = { ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac", ".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".webm": "video/webm", ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv", ".json": "application/json", ".xml": "application/xml", ".html": "text/html", ".log": "text/plain" }
 
@@ -180,7 +182,7 @@ function workspaceConfig(): Partial<PreprocessSettings> {
     const text = readFileSync(CONFIG_PATH, "utf8")
     const section = text.match(/^media_preprocess:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
     const out: Partial<PreprocessSettings> = {}
-    for (const key of ["maxExtractedChars", "timeoutMs", "maxFilesPerTransform", "maxArchiveEntries", "maxArchiveBytes", "maxCompressionRatio"] as const) {
+    for (const key of ["maxExtractedChars", "timeoutMs", "maxFilesPerTransform", "maxArchiveEntries", "maxArchiveBytes", "maxCompressionRatio", "maxPdfPageImages"] as const) {
       const m = section.match(new RegExp(`^\\s*${key}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
     }
     const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
@@ -198,6 +200,7 @@ function settings(opts: MediaPreprocessOptions): PreprocessSettings {
     maxArchiveEntries: positive(opts.maxArchiveEntries, positive(w.maxArchiveEntries, PREPROCESS_FALLBACKS.maxArchiveEntries)),
     maxArchiveBytes: positive(opts.maxArchiveBytes, positive(w.maxArchiveBytes, PREPROCESS_FALLBACKS.maxArchiveBytes)),
     maxCompressionRatio: positive(opts.maxCompressionRatio, positive(w.maxCompressionRatio, PREPROCESS_FALLBACKS.maxCompressionRatio)),
+    maxPdfPageImages: positive(opts.maxPdfPageImages, positive(w.maxPdfPageImages, PREPROCESS_FALLBACKS.maxPdfPageImages)),
   }
 }
 
@@ -215,6 +218,10 @@ function run(command: string, timeoutMs: number): Promise<string> {
     }).catch(e => { clearTimeout(timer); fail(e) })
   })
 }
+const PYTHON = "/Users/alanshum/.claude/skills/tool--pdf/scripts/.venv/bin/python"
+const PDF_RENDER_SCRIPT = "/Users/alanshum/.claude/skills/tool--pdf/scripts/pdf_render_pages.py"
+const PDF_LONG_EDGE_PX = 1568
+
 const defaults: Record<Kind, Extractor> = {
   pdf: async (path, timeout) => {
     const py = "/Users/alanshum/.claude/skills/tool--pdf/scripts/.venv/bin/python", script = "/Users/alanshum/.claude/skills/tool--pdf/scripts/pdf_tool.py"
@@ -349,9 +356,60 @@ function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: 
   if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
   if (kind === "archive") return augmentArchive(part, manifest, cfg, cache, extractors)
   if (!["pdf", "image", "audio", "video"].includes(kind)) return Promise.resolve(part)
-  return (async () => { try { localPath(manifest.path); const text = await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined); const clipped = text.slice(0, cfg.maxExtractedChars), truncated = clipped.length < text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`; return { ...part, text: `${part.text}\n${label}${clipped.trim() ? `\n${clipped}` : ""}` } } catch (e) { return { ...part, text: `${part.text}\n${MARKERS.failed} kind=${kind} reason=${safeError(e)}]` } } })()
+  return (async () => {
+    try {
+      localPath(manifest.path); const text = await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined); const clipped = text.slice(0, cfg.maxExtractedChars), truncated = clipped.length < text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`
+      let result = `${part.text}
+${label}${clipped.trim() ? `
+${clipped}` : ""}`
+      if (kind === "pdf" && existsSync(manifest.path)) {
+        try {
+          const sha256 = typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined
+          const pages = await extractPdfPages(manifest.path, sha256, cfg, cache)
+          result += `
+${MARKERS.pdfPages} count=${pages.count} maxPages=${cfg.maxPdfPageImages} truncated=${pages.truncated}]`
+          for (const p of pages.paths) result += `
+${p}`
+          if (pages.count > 0) {
+            result += `
+Dispatch \`vision-reader\` via \`task\` against these local paths before answering questions about them:`
+            for (let i = 0; i < pages.paths.length; i++) result += `
+- ${pages.paths[i]} (image/webp; page ${i + 1})`
+          }
+        } catch (pageError) {
+          result += `
+${MARKERS.pdfPagesFailed} failed=${safeError(pageError)}]`
+        }
+      }
+      return { ...part, text: result }
+    } catch (e) { return { ...part, text: `${part.text}
+${MARKERS.failed} kind=${kind} reason=${safeError(e)}]` } }
+  })()
 }
 function processed(text: string): boolean { return Object.values(MARKERS).some(marker => text.includes(marker)) }
+
+interface PdfPagesResult { paths: string[]; count: number; truncated: boolean }
+async function extractPdfPages(path: string, knownHash: string | undefined, cfg: PreprocessSettings, cache: string): Promise<PdfPagesResult> {
+  const hash = knownHash ?? (existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : "")
+  if (!hash) throw new Error("cannot compute pdf hash")
+  const pageDir = join(cache, `${hash}.pdfpages`)
+  if (!existsSync(pageDir)) privateDir(pageDir, "cache")
+  const completeMarker = join(pageDir, ".complete")
+  if (existsSync(completeMarker)) {
+    const meta = readFileSync(completeMarker, "utf8").trim().split("\n")
+    const rendered = Number(meta[0]) || 0
+    const total = Number(meta[1]) || rendered
+    const pagePaths = readdirSync(pageDir).filter(f => f.endsWith(".webp")).sort().map(f => { const p = resolve(join(pageDir, f)); chmodSync(p, 0o600); return p })
+    return { paths: pagePaths, count: rendered, truncated: total > cfg.maxPdfPageImages }
+  }
+  await run(`${sh(PYTHON)} ${sh(PDF_RENDER_SCRIPT)} ${sh(path)} ${sh(pageDir)} --max-pages ${cfg.maxPdfPageImages} --long-edge ${PDF_LONG_EDGE_PX}`, cfg.timeoutMs)
+  if (!existsSync(completeMarker)) throw new Error("pdf page renderer did not write completion marker")
+  const meta = readFileSync(completeMarker, "utf8").trim().split("\n")
+  const rendered = Number(meta[0]) || 0
+  const total = Number(meta[1]) || rendered
+  const pagePaths = readdirSync(pageDir).filter(f => f.endsWith(".webp")).sort().map(f => { const p = resolve(join(pageDir, f)); chmodSync(p, 0o600); return p })
+  return { paths: pagePaths, count: rendered, truncated: total > cfg.maxPdfPageImages }
+}
 
 
 export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => {

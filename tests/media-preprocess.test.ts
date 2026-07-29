@@ -215,6 +215,68 @@ try {
   const nestedArchivePart = part({ filename: "nested-archive.zip", path: nestedArchive, mime: "application/zip", media_kind: "archive", sha256: createHash("sha256").update(readFileSync(nestedArchive)).digest("hex") })
   const nestedArchiveContainer = { parts: [nestedArchivePart] }; await nestedArchiveHooks["chat.message"]!({}, nestedArchiveContainer)
   assert(nestedArchiveContainer.parts[0].text.includes('"handling":"nested-archive-skipped"'), "nested archive handling was not surfaced")
+
+  // Multi-column PDF page images: generate a 3-page 2-column PDF and
+  // verify the plugin produces per-page WebP images alongside extracted text.
+  const multiPdf = join(root, "multi-column.pdf")
+  const multiPy = join(root, "gen-multi-pdf.py")
+  writeFileSync(multiPy, [
+    'import fitz, sys',
+    'd = fitz.open()',
+    'for i in range(3):',
+    '    p = d.new_page()',
+    '    p.insert_text((50,80),"North Region Widget A: $1,200",fontsize=11)',
+    '    p.insert_text((50,100),"North Region Widget B: $3,400",fontsize=11)',
+    '    p.insert_text((50,130),"North Total: $4,600",fontsize=12)',
+    '    p.insert_text((310,80),"South Region Widget C: $2,100",fontsize=11)',
+    '    p.insert_text((310,100),"South Region Widget D: $800",fontsize=11)',
+    '    p.insert_text((310,130),"South Total: $2,900",fontsize=12)',
+    'd.save(sys.argv[1])',
+  ].join("\n"))
+  const py = "/Users/alanshum/.claude/skills/tool--pdf/scripts/.venv/bin/python"
+  assert(Bun.spawnSync([py, multiPy, multiPdf]).exitCode === 0 && existsSync(multiPdf), "could not generate multi-column PDF")
+  const multiSha = createHash("sha256").update(readFileSync(multiPdf)).digest("hex")
+  const multiPdfHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-multi"), cacheDir: join(root, "multi-cache"), extractors: { pdf: async () => "tabular data extracted" } })
+  const multiPart = part({ filename: "multi.pdf", path: multiPdf, mime: "application/pdf", media_kind: "pdf", sha256: multiSha }, "multi-pdf")
+  const multiContainer = { parts: [multiPart] }
+  await multiPdfHooks["chat.message"]!({}, multiContainer)
+  const multiText = multiContainer.parts[0].text
+  assert(multiText.includes("[media-preprocess pdf-pages: count=3"), "pdf-pages count marker missing")
+  assert(multiText.includes("Dispatch \`vision-reader\` via \`task\`"), "vision-reader dispatch missing")
+  assert(multiText.includes("page-0001.webp") && multiText.includes("page-0003.webp"), "page image paths missing")
+  assert(multiText.includes("tabular data extracted"), "text extraction broke")
+  const pageDir = join(join(root, "multi-cache"), `${multiSha}.pdfpages`)
+  assert(existsSync(pageDir), "page cache dir missing")
+  const webpFiles = readdirSync(pageDir).filter(f => f.endsWith(".webp")).sort()
+  assert(webpFiles.length === 3, "expected 3 page images")
+  for (const w of webpFiles) {
+    const size = statSync(join(pageDir, w)).size
+    assert(size < 500 * 1024, `page ${w} exceeds 500KB (${size} bytes)`)
+    assert(size > 0, `page ${w} is empty`)
+  }
+  const webpHead = readFileSync(join(pageDir, webpFiles[0])).subarray(0, 12)
+  assert(webpHead.slice(0, 4).toString() === "RIFF" && webpHead.slice(8, 12).toString() === "WEBP", "page image is not valid WebP")
+  console.log("PASS multi-column PDF: 3 pages, images under 500KB, text preserved")
+  console.log("PASS multi-column PDF page image sizes: " + webpFiles.map(f => statSync(join(pageDir, f)).size + "B").join(", "))
+
+  // pdfPages marker is terminal for idempotency
+  const multiAgain = multiText
+  await multiPdfHooks["chat.message"]!({}, multiContainer)
+  assert(multiContainer.parts[0].text === multiAgain, "multi-column pdf idempotency failed")
+
+  // Fail-safe: when pages rendering fails (bad path), text extraction still works
+  const badPdf = join(root, "bad.pdf")
+  writeFileSync(badPdf, "not a real pdf")
+  const badHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-bad"), cacheDir: join(root, "bad-cache"), extractors: { pdf: async () => "despite rasterization failure" } })
+  const badPart = part({ filename: "bad.pdf", path: badPdf, mime: "application/pdf", media_kind: "pdf", sha256: createHash("sha256").update(readFileSync(badPdf)).digest("hex") })
+  const badContainer = { parts: [badPart] }
+  await badHooks["chat.message"]!({}, badContainer)
+  const badText = badContainer.parts[0].text
+  assert(badText.includes("[media-preprocess pdf-pages-failed:"), "pdf pages failure marker missing: " + badText)
+  assert(badText.includes("despite rasterization failure"), "text extraction damaged by pages failure")
+  console.log("PASS pdf pages fail-safe: text path still succeeded")
+
+
   console.log("media-preprocess tests: all assertions passed")
 } finally {
   rmSync(root, { recursive: true, force: true })
