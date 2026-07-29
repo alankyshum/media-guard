@@ -1,3 +1,10 @@
 {
-  "name": "media-guard"
+  "name": "media-guard",
+  "version": "0.1.0",
+  "description": "Materializes chat attachments to disk and preprocesses them (PDF text + per-page WebP images, image OCR, audio/video transcription, scene-guided video keyframes, archive expansion) so text-only models can consume them.",
+  "author": {"name": "Alan Shum", "url": "https://alanshum.org"},
+  "repository": "https://github.com/alankyshum/media-guard",
+  "homepage": "https://github.com/alankyshum/media-guard",
+  "license": "MIT",
+  "keywords": ["media","pdf","ocr","transcription","video","attachments","preprocessing"]
 }
