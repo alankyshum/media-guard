@@ -45,9 +45,9 @@ def main() -> None:
         pil_img.save(page_path, "WEBP", quality=75)
 
     # Write completion marker: rendered_count, total_count
-    pathlib.Path(os.path.join(args.output_dir, ".complete")).write_text(
-        f"{rendered}\n{total}\n"
-    )
+    complete_path = pathlib.Path(os.path.join(args.output_dir, ".complete"))
+    complete_path.write_text(f"{rendered}\n{total}\n")
+    os.chmod(complete_path, 0o600)
     print("OK")
 
 

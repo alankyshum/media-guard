@@ -101,7 +101,9 @@ def main() -> None:
     for index, timestamp in enumerate(timestamps, 1):
         output = output_dir / f"frame-{index:04d}.webp"
         extract_frame(ffmpeg, args.video_path, timestamp, args.long_edge).save(output, "WEBP", quality=75)
-    (output_dir / ".complete").write_text(f"{len(timestamps)}\n{total}\n")
+    complete_path = output_dir / ".complete"
+    complete_path.write_text(f"{len(timestamps)}\n{total}\n")
+    os.chmod(complete_path, 0o600)
     print(json.dumps({"frames": [{"path": str(output_dir / f"frame-{index:04d}.webp"), "timestamp_seconds": timestamp} for index, timestamp in enumerate(timestamps, 1)]}))
 
 

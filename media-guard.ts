@@ -458,6 +458,7 @@ async function extractPdfPages(path: string, knownHash: string | undefined, cfg:
   if (!existsSync(pageDir)) privateDir(pageDir, "cache")
   const completeMarker = join(pageDir, ".complete")
   if (existsSync(completeMarker)) {
+    chmodSync(completeMarker, 0o600)
     const meta = readFileSync(completeMarker, "utf8").trim().split("\n")
     const rendered = Number(meta[0]) || 0
     const total = Number(meta[1]) || rendered
@@ -466,6 +467,7 @@ async function extractPdfPages(path: string, knownHash: string | undefined, cfg:
   }
   await run(`${sh(PYTHON)} ${sh(PDF_RENDER_SCRIPT)} ${sh(path)} ${sh(pageDir)} --max-pages ${cfg.maxPdfPageImages} --long-edge ${PDF_LONG_EDGE_PX}`, cfg.timeoutMs)
   if (!existsSync(completeMarker)) throw new Error("pdf page renderer did not write completion marker")
+  chmodSync(completeMarker, 0o600)
   const meta = readFileSync(completeMarker, "utf8").trim().split("\n")
   const rendered = Number(meta[0]) || 0
   const total = Number(meta[1]) || rendered
@@ -479,6 +481,7 @@ async function extractVideoKeyframes(path: string, knownHash: string | undefined
   if (!existsSync(frameDir)) privateDir(frameDir, "cache")
   const completeMarker = join(frameDir, ".complete")
   if (existsSync(completeMarker)) {
+    chmodSync(completeMarker, 0o600)
     const meta = readFileSync(completeMarker, "utf8").trim().split("\n")
     const extracted = Number(meta[0]) || 0
     const total = Number(meta[1]) || extracted
@@ -497,6 +500,7 @@ async function extractVideoKeyframes(path: string, knownHash: string | undefined
   }
   const rawOutput = await run(`${sh(PYTHON)} ${sh(VIDEO_KEYFRAME_SCRIPT)} ${sh(path)} ${sh(frameDir)} --max-frames ${cfg.maxVideoKeyframes}`, cfg.timeoutMs)
   if (!existsSync(completeMarker)) throw new Error("video keyframe extractor did not write completion marker")
+  chmodSync(completeMarker, 0o600)
   const meta = readFileSync(completeMarker, "utf8").trim().split("\n")
   const extracted = Number(meta[0]) || 0
   const total = Number(meta[1]) || extracted

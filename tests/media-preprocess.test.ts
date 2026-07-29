@@ -273,10 +273,12 @@ try {
   assert(multiText.includes("tabular data extracted"), "text extraction broke")
   const pageDir = join(join(root, "multi-cache"), `${multiSha}.pdfpages`)
   assert(existsSync(pageDir), "page cache dir missing")
+  assert((statSync(join(pageDir, ".complete")).mode & 0o777) === 0o600, "PDF completion marker is not 0600")
   const webpFiles = readdirSync(pageDir).filter(f => f.endsWith(".webp")).sort()
   assert(webpFiles.length === 3, "expected 3 page images")
   for (const w of webpFiles) {
     const size = statSync(join(pageDir, w)).size
+    assert((statSync(join(pageDir, w)).mode & 0o777) === 0o600, `page ${w} is not 0600`)
     assert(size < 500 * 1024, `page ${w} exceeds 500KB (${size} bytes)`)
     assert(size > 0, `page ${w} is empty`)
   }
@@ -335,10 +337,12 @@ try {
   const keyframeDirEntries = readdirSync(videoCacheDir).filter(e => e.includes(".keyframes"))
   assert(keyframeDirEntries.length === 1, "expected exactly one .keyframes cache dir")
   const keyframeDir = join(videoCacheDir, keyframeDirEntries[0])
+  assert((statSync(join(keyframeDir, ".complete")).mode & 0o777) === 0o600, "video completion marker is not 0600")
   const videoWebpFiles = readdirSync(keyframeDir).filter(f => f.endsWith(".webp")).sort()
   assert(videoWebpFiles.length === frameCount, `expected ${frameCount} WebP files, got ${videoWebpFiles.length}`)
   for (const w of videoWebpFiles) {
     const size = statSync(join(keyframeDir, w)).size
+    assert((statSync(join(keyframeDir, w)).mode & 0o777) === 0o600, `frame ${w} is not 0600`)
     assert(size > 0 && size < 500 * 1024, `frame ${w} size ${size} out of range`)
     const head = readFileSync(join(keyframeDir, w)).subarray(0, 12)
     assert(head.slice(0, 4).toString() === "RIFF" && head.slice(8, 12).toString() === "WEBP", `frame ${w} is not valid WebP`)
