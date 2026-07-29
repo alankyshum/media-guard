@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+check=0
+if [ "${1-}" = "--check" ]; then
+  [ "$#" -eq 1 ] || { printf '%s\n' '--check cannot be combined with input or format flags' >&2; exit 2; }
+  [ "$(uname -s)" = Darwin ] || { printf '%s\n' 'macOS with Vision is required' >&2; exit 2; }
+  command -v swiftc >/dev/null 2>&1 || { printf '%s\n' 'swiftc unavailable; install Xcode command-line tools' >&2; exit 2; }
+  check=1
+fi
+[ "$(uname -s)" = Darwin ] || { printf '%s\n' 'macOS with Vision is required' >&2; exit 2; }
+command -v swiftc >/dev/null 2>&1 || { printf '%s\n' 'swiftc unavailable; install Xcode command-line tools' >&2; exit 2; }
+format=json
+if [ "${2-}" = "--format" ]; then
+  format="${3-}"
+  [ "$#" -eq 3 ] || { printf '%s\n' 'usage: apple-vision-ocr IMAGE [--format json|yaml]' >&2; exit 2; }
+  set -- "$1"
+elif [ "${1-}" = "--format" ]; then
+  printf '%s\n' 'input image path is required before --format' >&2; exit 2
+fi
+[ "$format" = json ] || [ "$format" = yaml ] || { printf '%s\n' 'format must be json or yaml' >&2; exit 2; }
+bin="${TMPDIR:-/tmp}/apple-vision-ocr-$$"
+trap 'rm -f "$bin"' EXIT
+swiftc "$root/apple-vision-ocr.swift" -o "$bin" -framework Vision -framework ImageIO -framework CryptoKit
+if [ "$check" -eq 1 ]; then
+  printf '%s\n' 'Apple Vision OCR available'
+  exit 0
+fi
+json=$($bin "$@")
+if [ "$format" = json ]; then printf '%s\n' "$json"; exit 0; fi
+# JSON is a YAML 1.2 document. This preserves empty list/map types, Unicode,
+# multiline strings, quotes, and exact OCR text without a partial YAML emitter.
+printf '%s\n' "$json"

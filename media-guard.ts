@@ -11,7 +11,9 @@ type Options = Partial<Limits & PreprocessSettings> & { mimes?: string[]; materi
 const DEFAULT_MIMES = ["image/*", "application/pdf", "audio/*", "video/*", "application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed"]
 const FALLBACKS: Limits = { maxMaterializedBytes: 100 * 1024 * 1024, maxFilesPerTransform: 64, maxTotalMaterializedBytes: 500 * 1024 * 1024 }
 const PLUGIN_PATH = realpathSync(fileURLToPath(import.meta.url))
-const REPO_ROOT = resolve(dirname(PLUGIN_PATH), "../..")
+const PLUGIN_DIR = dirname(PLUGIN_PATH)
+const SCRIPTS_DIR = join(PLUGIN_DIR, "scripts")
+const REPO_ROOT = resolve(PLUGIN_DIR, "../..")
 const CONFIG_PATH = join(REPO_ROOT, "config/agent-runtime/agent-config.yml")
 const DEFAULT_DIR = join(tmpdir(), "opencode-media-guard")
 
@@ -236,15 +238,35 @@ function run(command: string, timeoutMs: number): Promise<string> {
     }).catch(e => { clearTimeout(timer); fail(e) })
   })
 }
-const PYTHON = "/Users/alanshum/.claude/skills/tool--pdf/scripts/.venv/bin/python"
-const PDF_RENDER_SCRIPT = "/Users/alanshum/.claude/skills/tool--pdf/scripts/pdf_render_pages.py"
+function executable(name: string, envName: string): string {
+  const override = process.env[envName]
+  if (override) {
+    if (!existsSync(override)) throw new Error(`${envName} points to a missing executable: ${override}`)
+    return override
+  }
+  const found = Bun.which(name)
+  if (!found) throw new Error(`${name} is required. Install it and ensure it is on PATH, or set ${envName}.`)
+  return found
+}
+function pythonExecutable(): string {
+  const override = process.env.MEDIA_GUARD_PYTHON
+  if (override) return executablePath(override, "MEDIA_GUARD_PYTHON")
+  for (const candidate of [join(PLUGIN_DIR, ".venv/bin/python"), join(SCRIPTS_DIR, ".venv/bin/python")]) if (existsSync(candidate)) return candidate
+  return executable("python3", "MEDIA_GUARD_PYTHON")
+}
+function executablePath(path: string, envName: string): string {
+  if (!existsSync(path)) throw new Error(`${envName} points to a missing executable: ${path}`)
+  return path
+}
+const PYTHON = pythonExecutable()
+const PDF_RENDER_SCRIPT = join(SCRIPTS_DIR, "pdf_render_pages.py")
 const PDF_LONG_EDGE_PX = 1568
-const VIDEO_KEYFRAME_SCRIPT = "/Users/alanshum/.claude/skills/tool--transcribe/scripts/video_keyframes.py"
+const VIDEO_KEYFRAME_SCRIPT = join(SCRIPTS_DIR, "video_keyframes.py")
 const VIDEO_LONG_EDGE_PX = 1568
 
 const defaults: Record<Kind, Extractor> = {
   pdf: async (path, timeout) => {
-    const py = "/Users/alanshum/.claude/skills/tool--pdf/scripts/.venv/bin/python", script = "/Users/alanshum/.claude/skills/tool--pdf/scripts/pdf_tool.py"
+    const py = PYTHON, script = join(SCRIPTS_DIR, "pdf_tool.py")
     const raw = await run(`${sh(py)} ${sh(script)} read-text ${sh(path)} --format json`, timeout)
     let text = ""
     try {
@@ -253,11 +275,11 @@ const defaults: Record<Kind, Extractor> = {
       collect(json)
     } catch { text = raw }
     if (text.trim()) return text
-    const ocr = "/Users/alanshum/.claude/skills/tool--pdf/scripts/ocr_extract.py"
+    const ocr = join(SCRIPTS_DIR, "ocr_extract.py")
     const ocrRaw = await run(`${sh(py)} ${sh(ocr)} ${sh(path)}`, timeout)
     return ocrRaw.trim()
   },
-  image: async (path, timeout) => { const raw = await run(`${sh("/Users/alanshum/.claude/skills/image--apple-vision-ocr/scripts/apple-vision-ocr")} ${sh(path)}`, timeout); const j = JSON.parse(raw); if (j.status !== "ok" || j.error) throw new Error(j.error || `OCR status ${j.status}`); return j.text || "" },
+  image: async (path, timeout) => { const raw = await run(`${sh(join(SCRIPTS_DIR, "apple-vision-ocr"))} ${sh(path)}`, timeout); const j = JSON.parse(raw); if (j.status !== "ok" || j.error) throw new Error(j.error || `OCR status ${j.status}`); return j.text || "" },
   audio: async (path, timeout) => transcribe(path, timeout),
   video: async (path, timeout) => transcribe(path, timeout),
 }
@@ -323,7 +345,7 @@ async function expandArchive(path: string, mime: string, cfg: PreprocessSettings
   return { files, skipped: skipped + found.skipped, truncated: false, root }
 }
 async function transcribe(path: string, timeout: number): Promise<string> {
-  const py = "/Users/alanshum/.claude/skills/tool--transcribe/scripts/.venv/bin/python", script = "/Users/alanshum/.claude/skills/tool--transcribe/scripts/transcribe_audio.py"
+  const py = PYTHON, script = join(SCRIPTS_DIR, "transcribe_audio.py")
   const dir = privateDir(join(realpathSync(tmpdir()), `opencode-media-preprocess-transcript-${process.pid}-${Math.random().toString(16).slice(2)}`))
   try {
     await run(`${sh(py)} ${sh(script)} ${sh(path)} --backend auto --model turbo --formats txt --output-dir ${sh(dir)}`, timeout)

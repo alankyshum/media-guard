@@ -233,7 +233,7 @@ try {
     '    p.insert_text((310,130),"South Total: $2,900",fontsize=12)',
     'd.save(sys.argv[1])',
   ].join("\n"))
-  const py = "/Users/alanshum/.claude/skills/tool--pdf/scripts/.venv/bin/python"
+  const py = process.env.MEDIA_GUARD_PYTHON ?? Bun.which("python3") ?? (() => { throw new Error("python3 is required; install Python 3 or set MEDIA_GUARD_PYTHON") })()
   assert(Bun.spawnSync([py, multiPy, multiPdf]).exitCode === 0 && existsSync(multiPdf), "could not generate multi-column PDF")
   const multiSha = createHash("sha256").update(readFileSync(multiPdf)).digest("hex")
   const multiPdfHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-multi"), cacheDir: join(root, "multi-cache"), extractors: { pdf: async () => "tabular data extracted" } })
@@ -279,7 +279,7 @@ try {
 
   // Video keyframe extraction: multi-scene video gets >=1 frame per scene cut
   const video = join(root, "multiscene.mp4")
-  const ffmpeg = "/opt/homebrew/bin/ffmpeg"
+  const ffmpeg = Bun.which("ffmpeg") ?? (() => { throw new Error("ffmpeg is required; install it or set PATH") })()
   // Create 3 distinct 2-second scenes (testsrc, red, blue) concatenated
   const scene1 = join(root, "scene1.mp4")
   const scene2 = join(root, "scene2.mp4")
