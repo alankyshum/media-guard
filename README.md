@@ -75,3 +75,4 @@ Environment overrides:
 ## Security model
 
 Staging and cache directories are created as private `0700` directories; materialized and generated files are `0600`. Source symlinks, staging-directory symlinks, archive symlinks, non-regular files, absolute archive names, drive-qualified names, and `..` traversal members are rejected or removed. Archive expansion is bounded by 200 entries, 500 MiB declared/post-extraction bytes, and a 200:1 compression ratio. Nested archives are reported but never recursively expanded. Temporary files are created with exclusive creation and renamed into place, and cached work requires a completion marker before reuse.
+++

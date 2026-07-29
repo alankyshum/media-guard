@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Extract scene-guided WebP keyframes from a video using ffmpeg and Pillow."""
+"""Extract scene-guided WebP keyframes from a video using ffmpeg and Pillow.
+
+Provenance: written independently from public ffmpeg documentation and first
+principles. Does not derive from, copy, or port any AGPL-licensed project.
+Algorithm: ffmpeg `select='gt(scene,T)',metadata=print` scene detection
+parsing `pts_time`, scene-guided timestamp selection with midpoint insertion
+for long segments, `-ss` extraction, Pillow WebP conversion.
+"""
 
 import argparse
 import json
