@@ -159,11 +159,11 @@ function errorPart(part: any, message: string): any {
 }
 
 type Kind = "pdf" | "image" | "audio" | "video" | "text" | "archive" | "other"
-type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number; maxPdfPageImages: number }
+type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number; maxPdfPageImages: number; maxVideoKeyframes: number }
 type Extractor = (path: string, timeoutMs: number) => Promise<string>
 export type MediaPreprocessOptions = Partial<PreprocessSettings> & { cacheDir?: string; extractors?: Partial<Record<Kind, Extractor>> }
 
-const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200, maxPdfPageImages: 50 }
+const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200, maxPdfPageImages: 50, maxVideoKeyframes: 20 }
 export const MARKERS = {
   extracted: "[media-preprocess extracted:",
   archive: "[media-preprocess archive:",
@@ -174,6 +174,8 @@ export const MARKERS = {
   needsAgent: "[media-preprocess needs-agent:",
   pdfPages: "[media-preprocess pdf-pages:",
   pdfPagesFailed: "[media-preprocess pdf-pages-failed:",
+  videoKeyframes: "[media-preprocess video-keyframes:",
+  videoKeyframesFailed: "[media-preprocess video-keyframes-failed:",
 } as const
 const MIME: Record<string, string> = { ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac", ".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".webm": "video/webm", ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv", ".json": "application/json", ".xml": "application/xml", ".html": "text/html", ".log": "text/plain" }
 
@@ -182,7 +184,7 @@ function workspaceConfig(): Partial<PreprocessSettings> {
     const text = readFileSync(CONFIG_PATH, "utf8")
     const section = text.match(/^media_preprocess:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
     const out: Partial<PreprocessSettings> = {}
-    for (const key of ["maxExtractedChars", "timeoutMs", "maxFilesPerTransform", "maxArchiveEntries", "maxArchiveBytes", "maxCompressionRatio", "maxPdfPageImages"] as const) {
+    for (const key of ["maxExtractedChars", "timeoutMs", "maxFilesPerTransform", "maxArchiveEntries", "maxArchiveBytes", "maxCompressionRatio", "maxPdfPageImages", "maxVideoKeyframes"] as const) {
       const m = section.match(new RegExp(`^\\s*${key}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
     }
     const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
@@ -201,6 +203,7 @@ function settings(opts: MediaPreprocessOptions): PreprocessSettings {
     maxArchiveBytes: positive(opts.maxArchiveBytes, positive(w.maxArchiveBytes, PREPROCESS_FALLBACKS.maxArchiveBytes)),
     maxCompressionRatio: positive(opts.maxCompressionRatio, positive(w.maxCompressionRatio, PREPROCESS_FALLBACKS.maxCompressionRatio)),
     maxPdfPageImages: positive(opts.maxPdfPageImages, positive(w.maxPdfPageImages, PREPROCESS_FALLBACKS.maxPdfPageImages)),
+    maxVideoKeyframes: positive(opts.maxVideoKeyframes, positive(w.maxVideoKeyframes, PREPROCESS_FALLBACKS.maxVideoKeyframes)),
   }
 }
 
@@ -221,6 +224,8 @@ function run(command: string, timeoutMs: number): Promise<string> {
 const PYTHON = "/Users/alanshum/.claude/skills/tool--pdf/scripts/.venv/bin/python"
 const PDF_RENDER_SCRIPT = "/Users/alanshum/.claude/skills/tool--pdf/scripts/pdf_render_pages.py"
 const PDF_LONG_EDGE_PX = 1568
+const VIDEO_KEYFRAME_SCRIPT = "/Users/alanshum/.claude/skills/tool--transcribe/scripts/video_keyframes.py"
+const VIDEO_LONG_EDGE_PX = 1568
 
 const defaults: Record<Kind, Extractor> = {
   pdf: async (path, timeout) => {
@@ -381,6 +386,25 @@ Dispatch \`vision-reader\` via \`task\` against these local paths before answeri
 ${MARKERS.pdfPagesFailed} failed=${safeError(pageError)}]`
         }
       }
+      if (kind === "video" && existsSync(manifest.path)) {
+        try {
+          const sha256 = typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined
+          const keyframes = await extractVideoKeyframes(manifest.path, sha256, cfg, cache)
+          result += `
+${MARKERS.videoKeyframes} count=${keyframes.count} maxFrames=${cfg.maxVideoKeyframes} truncated=${keyframes.truncated}]`
+          for (const k of keyframes.paths) result += `
+${k}`
+          if (keyframes.count > 0) {
+            result += `
+Dispatch \`vision-reader\` via \`task\` against these local paths before answering questions about them:`
+            for (let i = 0; i < keyframes.paths.length; i++) result += `
+- ${keyframes.paths[i]} (image/webp; frame ${i + 1} @ ${keyframes.timestamps[i]?.toFixed(3) ?? "?"}s)`
+          }
+        } catch (keyframeError) {
+          result += `
+${MARKERS.videoKeyframesFailed} failed=${safeError(keyframeError)}]`
+        }
+      }
       return { ...part, text: result }
     } catch (e) { return { ...part, text: `${part.text}
 ${MARKERS.failed} kind=${kind} reason=${safeError(e)}]` } }
@@ -389,6 +413,7 @@ ${MARKERS.failed} kind=${kind} reason=${safeError(e)}]` } }
 function processed(text: string): boolean { return Object.values(MARKERS).some(marker => text.includes(marker)) }
 
 interface PdfPagesResult { paths: string[]; count: number; truncated: boolean }
+interface VideoKeyframesResult { paths: string[]; timestamps: number[]; count: number; truncated: boolean }
 async function extractPdfPages(path: string, knownHash: string | undefined, cfg: PreprocessSettings, cache: string): Promise<PdfPagesResult> {
   const hash = knownHash ?? (existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : "")
   if (!hash) throw new Error("cannot compute pdf hash")
@@ -409,6 +434,47 @@ async function extractPdfPages(path: string, knownHash: string | undefined, cfg:
   const total = Number(meta[1]) || rendered
   const pagePaths = readdirSync(pageDir).filter(f => f.endsWith(".webp")).sort().map(f => { const p = resolve(join(pageDir, f)); chmodSync(p, 0o600); return p })
   return { paths: pagePaths, count: rendered, truncated: total > cfg.maxPdfPageImages }
+}
+async function extractVideoKeyframes(path: string, knownHash: string | undefined, cfg: PreprocessSettings, cache: string): Promise<VideoKeyframesResult> {
+  const hash = knownHash ?? (existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : "")
+  if (!hash) throw new Error("cannot compute video hash")
+  const frameDir = join(cache, `${hash}.keyframes`)
+  if (!existsSync(frameDir)) privateDir(frameDir, "cache")
+  const completeMarker = join(frameDir, ".complete")
+  if (existsSync(completeMarker)) {
+    const meta = readFileSync(completeMarker, "utf8").trim().split("\n")
+    const extracted = Number(meta[0]) || 0
+    const total = Number(meta[1]) || extracted
+    const framePaths = readdirSync(frameDir).filter(f => f.endsWith(".webp")).sort().map(f => { const p = resolve(join(frameDir, f)); chmodSync(p, 0o600); return p })
+    // Read timestamps from a timestamp file if it exists
+    const timestamps: number[] = []
+    const timestampFile = join(frameDir, ".timestamps")
+    if (existsSync(timestampFile)) {
+      const tsData = readFileSync(timestampFile, "utf8").trim()
+      try {
+        const parsed = JSON.parse(tsData)
+        if (Array.isArray(parsed)) timestamps.push(...parsed)
+      } catch {}
+    }
+    return { paths: framePaths, timestamps, count: extracted, truncated: total > cfg.maxVideoKeyframes }
+  }
+  const rawOutput = await run(`${sh(PYTHON)} ${sh(VIDEO_KEYFRAME_SCRIPT)} ${sh(path)} ${sh(frameDir)} --max-frames ${cfg.maxVideoKeyframes}`, cfg.timeoutMs)
+  if (!existsSync(completeMarker)) throw new Error("video keyframe extractor did not write completion marker")
+  const meta = readFileSync(completeMarker, "utf8").trim().split("\n")
+  const extracted = Number(meta[0]) || 0
+  const total = Number(meta[1]) || extracted
+  const framePaths = readdirSync(frameDir).filter(f => f.endsWith(".webp")).sort().map(f => { const p = resolve(join(frameDir, f)); chmodSync(p, 0o600); return p })
+  // Read timestamps from the JSON output
+  let timestamps: number[] = []
+  try {
+    const output = JSON.parse(rawOutput)
+    if (output.frames && Array.isArray(output.frames)) {
+      timestamps = output.frames.map((f: any) => f.timestamp_seconds)
+    }
+  } catch {}
+  // Write timestamps to file for cache
+  writeFileSync(join(frameDir, ".timestamps"), JSON.stringify(timestamps), { mode: 0o600 })
+  return { paths: framePaths, timestamps, count: extracted, truncated: total > cfg.maxVideoKeyframes }
 }
 
 

@@ -277,6 +277,65 @@ try {
   console.log("PASS pdf pages fail-safe: text path still succeeded")
 
 
+  // Video keyframe extraction: multi-scene video gets >=1 frame per scene cut
+  const video = join(root, "multiscene.mp4")
+  const ffmpeg = "/opt/homebrew/bin/ffmpeg"
+  // Create 3 distinct 2-second scenes (testsrc, red, blue) concatenated
+  const scene1 = join(root, "scene1.mp4")
+  const scene2 = join(root, "scene2.mp4")
+  const scene3 = join(root, "scene3.mp4")
+  assert(Bun.spawnSync([ffmpeg, "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=30", "-c:v", "libx264", "-pix_fmt", "yuv420p", scene1]).exitCode === 0, "scene1 gen failed")
+  assert(Bun.spawnSync([ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=red:duration=2:size=320x240:rate=30", "-c:v", "libx264", "-pix_fmt", "yuv420p", scene2]).exitCode === 0, "scene2 gen failed")
+  assert(Bun.spawnSync([ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=blue:duration=2:size=320x240:rate=30", "-c:v", "libx264", "-pix_fmt", "yuv420p", scene3]).exitCode === 0, "scene3 gen failed")
+  const concatList = join(root, "concat.txt")
+  writeFileSync(concatList, `file '${scene1}'\nfile '${scene2}'\nfile '${scene3}'\n`)
+  assert(Bun.spawnSync([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", concatList, "-c", "copy", video]).exitCode === 0, "concat failed")
+
+  const videoSha = createHash("sha256").update(readFileSync(video)).digest("hex")
+  const videoHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-video"), cacheDir: join(root, "video-cache"), extractors: { video: async () => "video transcript" } })
+  const videoPart = part({ filename: "multiscene.mp4", path: video, mime: "video/mp4", media_kind: "video", sha256: videoSha })
+  const videoContainer = { parts: [videoPart] }
+  await videoHooks["chat.message"]!({}, videoContainer)
+  const videoText = videoContainer.parts[0].text
+  assert(videoText.includes("[media-preprocess video-keyframes:"), "video-keyframes marker missing: " + videoText)
+  assert(videoText.includes("Dispatch \`vision-reader\` via \`task\`"), "vision-reader dispatch missing from video keyframes")
+  // Extract frame count from marker
+  const frameMatch = videoText.match(/video-keyframes: count=(\d+)/)
+  assert(frameMatch, "could not parse frame count from marker: " + videoText)
+  const frameCount = parseInt(frameMatch[1], 10)
+  assert(frameCount >= 2, `expected at least 2 frames (one per scene cut), got ${frameCount}`)
+  // Verify WebP output files exist and have valid headers
+  const videoCacheDir = join(root, "video-cache")
+  const keyframeDirEntries = readdirSync(videoCacheDir).filter(e => e.includes(".keyframes"))
+  assert(keyframeDirEntries.length === 1, "expected exactly one .keyframes cache dir")
+  const keyframeDir = join(videoCacheDir, keyframeDirEntries[0])
+  const videoWebpFiles = readdirSync(keyframeDir).filter(f => f.endsWith(".webp")).sort()
+  assert(videoWebpFiles.length === frameCount, `expected ${frameCount} WebP files, got ${videoWebpFiles.length}`)
+  for (const w of videoWebpFiles) {
+    const size = statSync(join(keyframeDir, w)).size
+    assert(size > 0 && size < 500 * 1024, `frame ${w} size ${size} out of range`)
+    const head = readFileSync(join(keyframeDir, w)).subarray(0, 12)
+    assert(head.slice(0, 4).toString() === "RIFF" && head.slice(8, 12).toString() === "WEBP", `frame ${w} is not valid WebP`)
+  }
+  console.log(`PASS video keyframes: ${frameCount} frames, WebP sizes: ${videoWebpFiles.map(f => statSync(join(keyframeDir, f)).size + "B").join(", ")}`)
+
+  // Transcript path unaffected: text extraction still runs and is present
+  assert(videoText.includes("video transcript"), "video transcript extraction broken by keyframes")
+  console.log("PASS video transcript path unaffected by keyframes")
+
+  // Fail-safe: corrupt video still produces transcript, emits failure marker, no throw
+  const corruptVideo = join(root, "corrupt.mp4")
+  writeFileSync(corruptVideo, "not a video")
+  const corruptSha = createHash("sha256").update(readFileSync(corruptVideo)).digest("hex")
+  const corruptHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-corrupt"), cacheDir: join(root, "corrupt-cache"), extractors: { video: async () => "transcript despite corrupt video" } })
+  const corruptVideoPart = part({ filename: "corrupt.mp4", path: corruptVideo, mime: "video/mp4", media_kind: "video", sha256: corruptSha })
+  const corruptVideoContainer = { parts: [corruptVideoPart] }
+  await corruptHooks["chat.message"]!({}, corruptVideoContainer)
+  const corruptText = corruptVideoContainer.parts[0].text
+  assert(corruptText.includes("[media-preprocess video-keyframes-failed:"), "video-keyframes-failed marker missing: " + corruptText)
+  assert(corruptText.includes("transcript despite corrupt video"), "text extraction damaged by keyframe failure")
+  console.log("PASS video keyframes fail-safe: transcript path still succeeded")
+
   console.log("media-preprocess tests: all assertions passed")
 } finally {
   rmSync(root, { recursive: true, force: true })
