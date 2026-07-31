@@ -1,14 +1,15 @@
 // Materialize attachments. Never inspect media content beyond staging/hash bytes.
 import type { Plugin } from "@opencode-ai/plugin"
 import { createHash } from "node:crypto"
-import { accessSync, appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, closeSync, unlinkSync, writeSync, writeFileSync, constants as fsConstants, rmSync, readdirSync } from "node:fs"
+import { accessSync, appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, closeSync, unlinkSync, writeSync, writeFileSync, constants as fsConstants, rmSync, readdirSync } from "node:fs"
 import { basename, dirname, extname, join, resolve, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 
 type Limits = { maxMaterializedBytes: number; maxFilesPerTransform: number; maxTotalMaterializedBytes: number }
 type Options = Partial<Limits & PreprocessSettings> & { mimes?: string[]; materializationDir?: string; cacheDir?: string; extractors?: Partial<Record<Kind, Extractor>> }
-const DEFAULT_MIMES = ["image/*", "application/pdf", "audio/*", "video/*", "application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed"]
+const TEXT_MIMES = ["application/json", "application/xml", "application/yaml", "application/x-yaml", "application/javascript", "application/x-javascript", "application/typescript", "application/toml", "application/x-ndjson", "application/x-sh"]
+const DEFAULT_MIMES = ["image/*", "application/pdf", "audio/*", "video/*", "application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed", "text/*", ...TEXT_MIMES]
 const FALLBACKS: Limits = { maxMaterializedBytes: 100 * 1024 * 1024, maxFilesPerTransform: 64, maxTotalMaterializedBytes: 500 * 1024 * 1024 }
 const PLUGIN_PATH = realpathSync(fileURLToPath(import.meta.url))
 const PLUGIN_DIR = dirname(PLUGIN_PATH)
@@ -50,7 +51,7 @@ function matchesMime(mime: string, patterns: string[]): boolean {
   const normalized = canonicalMime(mime)
   return patterns.some(pattern => { const p = canonicalMime(pattern); return p === normalized || (p.endsWith("/*") && normalized.startsWith(p.slice(0, -1))) })
 }
-function mediaKind(mime: string): string { const normalized = canonicalMime(mime); return normalized === "application/pdf" ? "pdf" : normalized.startsWith("image/") ? "image" : normalized.startsWith("audio/") ? "audio" : normalized.startsWith("video/") ? "video" : ["application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed"].includes(normalized) ? "archive" : "file" }
+function mediaKind(mime: string): string { const normalized = canonicalMime(mime); return normalized === "application/pdf" ? "pdf" : normalized.startsWith("image/") ? "image" : normalized.startsWith("audio/") ? "audio" : normalized.startsWith("video/") ? "video" : normalized.startsWith("text/") || TEXT_MIMES.includes(normalized) ? "text" : ["application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed"].includes(normalized) ? "archive" : "file" }
 function safeName(value: unknown): string {
   const name = basename(typeof value === "string" ? value : "attachment").replace(/[\u0000-\u001f\u007f/\\]/g, "_").replace(/[^A-Za-z0-9._ -]/g, "_").trim()
   return name && name !== "." && name !== ".." ? name : "attachment"
@@ -90,7 +91,7 @@ function diagnosticLog(dir: string, hook: string, parts: any[], error?: unknown)
     appendFileSync(join(dir, "media-guard.log"), `${JSON.stringify(record)}\n`, { mode: 0o600 })
   } catch {}
 }
-function extension(part: any, mime: string): string { return extname(safeName(part?.filename)) || ({ "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf", "application/zip": ".zip", "application/x-zip-compressed": ".zip", "application/gzip": ".tar.gz", "application/x-gzip": ".gz", "application/x-tar": ".tar", "application/x-bzip2": ".bz2", "application/x-xz": ".xz", "application/x-7z-compressed": ".7z", "application/vnd.rar": ".rar", "application/x-rar-compressed": ".rar" } as Record<string, string>)[canonicalMime(mime)] || ".bin" }
+function extension(part: any, mime: string): string { return extname(safeName(part?.filename)) || ({ "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf", "application/zip": ".zip", "application/x-zip-compressed": ".zip", "application/gzip": ".tar.gz", "application/x-gzip": ".gz", "application/x-tar": ".tar", "application/x-bzip2": ".bz2", "application/x-xz": ".xz", "application/x-7z-compressed": ".7z", "application/vnd.rar": ".rar", "application/x-rar-compressed": ".rar", "text/plain": ".txt", "text/markdown": ".md", "text/csv": ".csv", "text/html": ".html", "text/xml": ".xml", "application/json": ".json", "application/xml": ".xml", "application/yaml": ".yaml", "application/x-yaml": ".yaml", "application/javascript": ".js", "application/x-javascript": ".js", "application/typescript": ".ts", "application/toml": ".toml", "application/x-sh": ".sh" } as Record<string, string>)[canonicalMime(mime)] || ".bin" }
 function writeAll(fd: number, bytes: Buffer): void {
   let offset = 0
   while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset)
@@ -166,23 +167,24 @@ function errorPart(part: any, message: string): any {
 }
 
 type Kind = "pdf" | "image" | "audio" | "video" | "text" | "archive" | "other"
-type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number; maxPdfPageImages: number; maxVideoKeyframes: number }
+type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number; maxPdfPageImages: number; maxVideoKeyframes: number; maxTextBytes: number; maxTextChars: number }
 type Extractor = (path: string, timeoutMs: number) => Promise<string>
 export type MediaPreprocessOptions = Partial<PreprocessSettings> & { cacheDir?: string; extractors?: Partial<Record<Kind, Extractor>> }
 
-const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200, maxPdfPageImages: 50, maxVideoKeyframes: 20 }
+const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200, maxPdfPageImages: 50, maxVideoKeyframes: 20, maxTextBytes: 409600, maxTextChars: 100000 }
 export const MARKERS = {
-  extracted: "[media-preprocess extracted:",
-  archive: "[media-preprocess archive:",
-  archiveFailed: "[media-preprocess archive failed:",
-  failed: "[media-preprocess failed:",
-  uncertain: "[media-preprocess uncertain:",
-  autoExtracted: "[media-preprocess auto-extracted:",
-  needsAgent: "[media-preprocess needs-agent:",
-  pdfPages: "[media-preprocess pdf-pages:",
-  pdfPagesFailed: "[media-preprocess pdf-pages-failed:",
-  videoKeyframes: "[media-preprocess video-keyframes:",
-  videoKeyframesFailed: "[media-preprocess video-keyframes-failed:",
+ extracted: "[media-preprocess extracted:",
+ archive: "[media-preprocess archive:",
+ archiveFailed: "[media-preprocess archive failed:",
+ failed: "[media-preprocess failed:",
+ uncertain: "[media-preprocess uncertain:",
+ autoExtracted: "[media-preprocess auto-extracted:",
+ needsAgent: "[media-preprocess needs-agent:",
+ pdfPages: "[media-preprocess pdf-pages:",
+ pdfPagesFailed: "[media-preprocess pdf-pages-failed:",
+ videoKeyframes: "[media-preprocess video-keyframes:",
+ videoKeyframesFailed: "[media-preprocess video-keyframes-failed:",
+  textFile: "[media-preprocess text-file:",
 } as const
 const MIME: Record<string, string> = { ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac", ".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".webm": "video/webm", ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv", ".json": "application/json", ".xml": "application/xml", ".html": "text/html", ".log": "text/plain" }
 
@@ -200,6 +202,8 @@ function workspaceConfig(): Partial<PreprocessSettings> {
       maxCompressionRatio: "maxCompressionRatio",
       maxPdfPageImages: "maxPdfPageImages",
       maxVideoKeyframes: "maxVideoKeyframes",
+      maxTextBytes: "maxTextBytes",
+      maxTextChars: "maxTextChars",
     }
     for (const [configKey, key] of Object.entries(keys)) {
       const m = section.match(new RegExp(`^\\s*${configKey}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
@@ -221,6 +225,8 @@ function settings(opts: MediaPreprocessOptions): PreprocessSettings {
     maxCompressionRatio: positive(opts.maxCompressionRatio, positive(w.maxCompressionRatio, PREPROCESS_FALLBACKS.maxCompressionRatio)),
     maxPdfPageImages: positive(opts.maxPdfPageImages, positive(w.maxPdfPageImages, PREPROCESS_FALLBACKS.maxPdfPageImages)),
     maxVideoKeyframes: positive(opts.maxVideoKeyframes, positive(w.maxVideoKeyframes, PREPROCESS_FALLBACKS.maxVideoKeyframes)),
+    maxTextBytes: positive(opts.maxTextBytes, positive(w.maxTextBytes, PREPROCESS_FALLBACKS.maxTextBytes)),
+    maxTextChars: positive(opts.maxTextChars, positive(w.maxTextChars, PREPROCESS_FALLBACKS.maxTextChars)),
   }
 }
 
@@ -354,16 +360,40 @@ async function transcribe(path: string, timeout: number): Promise<string> {
     return await files.text()
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
+async function hashFile(path: string): Promise<string> { const hash = createHash("sha256"); for await (const chunk of createReadStream(path)) hash.update(chunk); return hash.digest("hex") }
 function parseManifest(part: any): any | null {
   if (part?.type !== "text" || typeof part.text !== "string" || !part.text.startsWith("[media-guard attachment manifest]")) return null
   try { return JSON.parse(part.text.split("\n", 2)[1]) } catch { return null }
 }
 function localPath(path: unknown): asserts path is string { if (typeof path !== "string" || !path.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(path)) throw new Error("manifest path is not a local absolute path") }
-function extractorName(kind: Kind) { return kind === "pdf" ? "pdf_tool.read-text" : kind === "image" ? "apple-vision-ocr" : "transcribe_audio" }
+function extractorName(kind: Kind) { return kind === "pdf" ? "pdf_tool.read-text" : kind === "image" ? "apple-vision-ocr" : kind === "text" ? "bounded-read" : "transcribe_audio" }
+async function extractText(path: string, cfg: PreprocessSettings, cache: string, knownHash?: string): Promise<{ text: string; truncated: boolean }> {
+  const hash = knownHash ?? (existsSync(path) ? await hashFile(path) : ""), key = hash ? join(cache, `${hash}.text.${cfg.maxTextChars}.${cfg.maxTextBytes}.txt`) : null
+  const limit = Math.min(cfg.maxTextBytes, cfg.maxTextChars * 4)
+  if (key && existsSync(key)) {
+    chmodSync(key, 0o600)
+    const full = readFileSync(key, "utf8")
+    return { text: full.slice(0, cfg.maxTextChars), truncated: statSync(path).size > limit || full.length > cfg.maxTextChars }
+  }
+  const size = statSync(path).size, fd = openSync(path, "r"), buf = Buffer.alloc(limit + 1)
+  let got = 0
+  try { while (got < buf.length) { const n = readSync(fd, buf, got, buf.length - got, got); if (n <= 0) break; got += n } } finally { closeSync(fd) }
+  const end = Math.min(got, limit)
+  let decodeEnd = end
+  if (decodeEnd > 0 && buf[decodeEnd - 1] >= 0x80) {
+    let i = decodeEnd
+    while (i > 0 && (buf[i - 1] & 0xC0) === 0x80) i--
+    if (i === 0) decodeEnd = 0
+    else { const b = buf[i - 1], need = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC0 ? 1 : 0; if (need === 0 || decodeEnd - i < need) decodeEnd = need === 0 ? i : i - 1 }
+  }
+  const full = buf.subarray(0, decodeEnd).toString("utf8"), text = full.slice(0, cfg.maxTextChars), truncated = size > limit || full.length > cfg.maxTextChars
+  if (key) { writeFileSync(key, full, { mode: 0o600 }); chmodSync(key, 0o600) }
+  return { text, truncated }
+}
 async function extractOne(kind: Kind, path: string, mime: string, cfg: PreprocessSettings, cache: string, extractors: Record<Kind, Extractor>, knownHash?: string): Promise<string> {
-  const hash = knownHash ?? (existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : ""), key = hash ? join(cache, `${hash}.${kind}.txt`) : null
+  if (kind === "text") return (await extractText(path, cfg, cache, knownHash)).text
+  const hash = knownHash ?? (existsSync(path) ? await hashFile(path) : ""), key = hash ? join(cache, `${hash}.${kind}.txt`) : null
   if (key && existsSync(key)) { chmodSync(key, 0o600); return readFileSync(key, "utf8") }
-  if (kind === "text") { const text = readFileSync(path, "utf8"); if (key) { writeFileSync(key, text, { mode: 0o600 }); chmodSync(key, 0o600) }; return text }
   if (!(kind in extractors)) return ""
   const text = await extractors[kind](path, cfg.timeoutMs)
   if (key) { writeFileSync(key, text, { mode: 0o600 }); chmodSync(key, 0o600) }
@@ -393,14 +423,30 @@ async function augmentArchive(part: any, manifest: any, cfg: PreprocessSettings,
   } catch (e) { return { ...part, text: `${part.text}\n${MARKERS.archiveFailed} reason=${safeError(e)}]` } }
 }
 function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: Record<Kind, Extractor>): Promise<any> {
-  const manifest = parseManifest(part); if (!manifest || !manifest.path || Object.prototype.hasOwnProperty.call(manifest, "error") || processed(part.text)) return Promise.resolve(part)
-  const kind = classify(manifest.path, manifest.mime) === "other" ? manifest.media_kind as Kind : classify(manifest.path, manifest.mime)
-  if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
-  if (kind === "archive") return augmentArchive(part, manifest, cfg, cache, extractors)
-  if (!["pdf", "image", "audio", "video", "text"].includes(kind)) return Promise.resolve(part)
-  return (async () => {
-    try {
-      localPath(manifest.path); const text = await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined); const clipped = text.slice(0, cfg.maxExtractedChars), truncated = clipped.length < text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`
+ const manifest = parseManifest(part); if (!manifest || !manifest.path || Object.prototype.hasOwnProperty.call(manifest, "error") || processed(part.text)) return Promise.resolve(part)
+ const kind = classify(manifest.path, manifest.mime) === "other" ? manifest.media_kind as Kind : classify(manifest.path, manifest.mime)
+ if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
+ if (kind === "archive") return augmentArchive(part, manifest, cfg, cache, extractors)
+ if (!["pdf", "image", "audio", "video", "text"].includes(kind)) return Promise.resolve(part)
+  if (kind === "text") {
+    return (async () => {
+      try {
+        localPath(manifest.path)
+        const st = statSync(manifest.path)
+        const size = typeof manifest.size === "number" && manifest.size > 0 ? manifest.size : st.size
+        const mime = manifest.mime ?? "text/plain"
+        return { ...part, text: `${part.text}\n${MARKERS.textFile} path=${manifest.path} size=${size} mime=${mime}]\nUse the \`read\` tool with the path above to read this file directly. For large files, use offset/limit to read in chunks.` }
+      } catch (e) {
+        return { ...part, text: `${part.text}\n${MARKERS.failed} kind=text reason=${safeError(e)}]` }
+      }
+    })()
+  }
+ return (async () => {
+   try {
+     localPath(manifest.path)
+      const knownHash = typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined
+      const extracted = kind === "text" ? await extractText(manifest.path, cfg, cache, knownHash) : { text: await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, knownHash), truncated: false }
+      const budget = kind === "text" ? cfg.maxTextChars : cfg.maxExtractedChars, clipped = extracted.text.slice(0, budget), truncated = extracted.truncated || clipped.length < extracted.text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`
       let result = `${part.text}
 ${label}${clipped.trim() ? `
 ${clipped}` : ""}`
