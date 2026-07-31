@@ -17,6 +17,7 @@ const SCRIPTS_DIR = join(PLUGIN_DIR, "scripts")
 const REPO_ROOT = resolve(PLUGIN_DIR, "../..")
 const CONFIG_PATH = join(REPO_ROOT, "config/agent-runtime/agent-config.yml")
 const DEFAULT_DIR = join(tmpdir(), "opencode-media-guard")
+const ATTACHMENT_READ_MARKER = "Called the Read tool with the following input:"
 
 function positive(value: unknown, fallback: number): number { return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback }
 function workspaceLimits(): Partial<Limits> {
@@ -187,6 +188,10 @@ export const MARKERS = {
   textFile: "[media-preprocess text-file:",
 } as const
 const MIME: Record<string, string> = { ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac", ".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".webm": "video/webm", ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv", ".json": "application/json", ".xml": "application/xml", ".html": "text/html", ".log": "text/plain" }
+function attachmentReadPath(part: any): string | null {
+  if (part?.type !== "text" || typeof part.text !== "string" || !part.text.startsWith(ATTACHMENT_READ_MARKER)) return null
+  try { const args = JSON.parse(part.text.slice(ATTACHMENT_READ_MARKER.length)); return typeof args?.filePath === "string" && args.filePath ? args.filePath : null } catch { return null }
+}
 
 function workspaceConfig(): Partial<PreprocessSettings> {
   try {
@@ -423,11 +428,11 @@ async function augmentArchive(part: any, manifest: any, cfg: PreprocessSettings,
   } catch (e) { return { ...part, text: `${part.text}\n${MARKERS.archiveFailed} reason=${safeError(e)}]` } }
 }
 function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: Record<Kind, Extractor>): Promise<any> {
- const manifest = parseManifest(part); if (!manifest || !manifest.path || Object.prototype.hasOwnProperty.call(manifest, "error") || processed(part.text)) return Promise.resolve(part)
- const kind = classify(manifest.path, manifest.mime) === "other" ? manifest.media_kind as Kind : classify(manifest.path, manifest.mime)
- if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
- if (kind === "archive") return augmentArchive(part, manifest, cfg, cache, extractors)
- if (!["pdf", "image", "audio", "video", "text"].includes(kind)) return Promise.resolve(part)
+  const manifest = parseManifest(part); if (!manifest || !manifest.path || Object.prototype.hasOwnProperty.call(manifest, "error") || processed(part.text)) return Promise.resolve(part)
+  const kind = classify(manifest.path, manifest.mime) === "other" ? manifest.media_kind as Kind : classify(manifest.path, manifest.mime)
+  if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
+  if (kind === "archive") return augmentArchive(part, manifest, cfg, cache, extractors)
+  if (!["pdf", "image", "audio", "video", "text"].includes(kind)) return Promise.resolve(part)
   if (kind === "text") {
     return (async () => {
       try {
@@ -445,8 +450,8 @@ function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: 
    try {
      localPath(manifest.path)
       const knownHash = typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined
-      const extracted = kind === "text" ? await extractText(manifest.path, cfg, cache, knownHash) : { text: await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, knownHash), truncated: false }
-      const budget = kind === "text" ? cfg.maxTextChars : cfg.maxExtractedChars, clipped = extracted.text.slice(0, budget), truncated = extracted.truncated || clipped.length < extracted.text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`
+       const text = await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, knownHash)
+       const clipped = text.slice(0, cfg.maxExtractedChars), truncated = clipped.length < text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`
       let result = `${part.text}
 ${label}${clipped.trim() ? `
 ${clipped}` : ""}`
@@ -494,6 +499,28 @@ ${MARKERS.failed} kind=${kind} reason=${safeError(e)}]` } }
   })()
 }
 function processed(text: string): boolean { return Object.values(MARKERS).some(marker => text.includes(marker)) }
+function guardAttachmentReads(parts: any[], roots: string[], dir: string): void {
+  try {
+    const swaps: { part: any; text: string }[] = []
+    for (let i = 0; i + 1 < parts.length; i++) {
+      const filePath = attachmentReadPath(parts[i]), content = parts[i + 1]
+      if (!filePath || content?.type !== "text" || typeof content.text !== "string" || processed(content.text)) continue
+      const candidates = filePath.startsWith("/") ? [resolve(filePath)] : [...roots.map(root => resolve(root, filePath)), resolve(process.cwd(), filePath)]
+      let path: string | null = null
+      for (const candidate of candidates) {
+        try { if (existsSync(candidate) && lstatSync(candidate).isFile()) { path = candidate; break } } catch {}
+      }
+      if (!path) continue
+      const mime = MIME[extname(path).toLowerCase()] ?? "text/plain"
+      if (classify(path, mime) !== "text") continue
+      const size = statSync(path).size
+      swaps.push({ part: content, text: `${MARKERS.textFile} path=${path} size=${size} mime=${mime}]
+Use the \`read\` tool with the path above to read this file directly. For large files, use offset/limit to read in chunks.` })
+    }
+    for (const swap of swaps) swap.part.text = swap.text
+    if (swaps.length) diagnosticLog(dir, "guardAttachmentReads.swapped", parts)
+  } catch (error) { diagnosticLog(dir, "guardAttachmentReads.error", parts, error) }
+}
 
 interface PdfPagesResult { paths: string[]; count: number; truncated: boolean }
 interface VideoKeyframesResult { paths: string[]; timestamps: number[]; count: number; truncated: boolean }
@@ -565,7 +592,8 @@ async function extractVideoKeyframes(path: string, knownHash: string | undefined
 }
 
 
-export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => {
+export const MediaGuardPlugin: Plugin = async (context, opts: Options = {}) => {
+  const projectRoots = [context?.directory, context?.worktree].filter((v): v is string => typeof v === "string" && !!v)
   const configured = limits(opts); const patterns = opts.mimes ?? DEFAULT_MIMES; const dir = privateDir(opts.materializationDir ?? DEFAULT_DIR)
   const preprocessConfig = settings(opts)
   const preprocessCache = privateDir(opts.cacheDir ?? join(realpathSync(tmpdir()), "opencode-media-preprocess"), "cache")
@@ -628,6 +656,7 @@ export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => 
       }
       for (const message of messages) {
         if (!Array.isArray(message?.parts)) continue; snapshots.set(message, message.parts.slice())
+        guardAttachmentReads(message.parts, projectRoots, dir)
         await transformParts(message.parts, state)
         await preprocessParts(message.parts, preprocessState)
       }
@@ -642,7 +671,7 @@ export const MediaGuardPlugin: Plugin = async (_context, opts: Options = {}) => 
     diagnosticLog(dir, "chat.message", parts ?? [])
     if (!parts) return
     const snapshot = parts.slice()
-    try { await transformParts(parts); await preprocessParts(parts) }
+    try { guardAttachmentReads(parts, projectRoots, dir); await transformParts(parts); await preprocessParts(parts) }
     catch (error) {
       diagnosticLog(dir, "chat.message.error", parts, error)
       console.error("[media-guard] chat.message transform failed:", safeError(error))
