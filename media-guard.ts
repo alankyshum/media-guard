@@ -371,7 +371,7 @@ function parseManifest(part: any): any | null {
   try { return JSON.parse(part.text.split("\n", 2)[1]) } catch { return null }
 }
 function localPath(path: unknown): asserts path is string { if (typeof path !== "string" || !path.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(path)) throw new Error("manifest path is not a local absolute path") }
-function extractorName(kind: Kind) { return kind === "pdf" ? "pdf_tool.read-text" : kind === "image" ? "apple-vision-ocr" : kind === "text" ? "bounded-read" : "transcribe_audio" }
+function extractorName(kind: Kind) { return kind === "pdf" ? "pdf_tool.read-text" : kind === "image" ? "apple-vision-ocr" : "transcribe_audio" }
 async function extractText(path: string, cfg: PreprocessSettings, cache: string, knownHash?: string): Promise<{ text: string; truncated: boolean }> {
   const hash = knownHash ?? (existsSync(path) ? await hashFile(path) : ""), key = hash ? join(cache, `${hash}.text.${cfg.maxTextChars}.${cfg.maxTextBytes}.txt`) : null
   const limit = Math.min(cfg.maxTextBytes, cfg.maxTextChars * 4)
@@ -446,12 +446,12 @@ function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: 
       }
     })()
   }
- return (async () => {
-   try {
-     localPath(manifest.path)
+  return (async () => {
+    try {
+      localPath(manifest.path)
       const knownHash = typeof manifest.sha256 === "string" && /^[a-f0-9]{64}$/i.test(manifest.sha256) ? manifest.sha256 : undefined
-       const text = await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, knownHash)
-       const clipped = text.slice(0, cfg.maxExtractedChars), truncated = clipped.length < text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`
+      const text = await extractOne(kind, manifest.path, manifest.mime, cfg, cache, extractors, knownHash)
+      const clipped = text.slice(0, cfg.maxExtractedChars), truncated = clipped.length < text.length; const label = clipped.trim() ? `${MARKERS.extracted} kind=${kind} extractor=${extractorName(kind)} chars=${clipped.length} truncated=${truncated}]` : `${MARKERS.uncertain} kind=${kind} extractor=${extractorName(kind)} reason=empty output]`
       let result = `${part.text}
 ${label}${clipped.trim() ? `
 ${clipped}` : ""}`
