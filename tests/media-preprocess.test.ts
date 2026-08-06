@@ -74,6 +74,23 @@ try {
   await failing["chat.message"]!({}, failedContainer)
   assert(failedContainer.parts[0].text.startsWith(originalManifest) && failedContainer.parts[0].text.includes("[media-preprocess failed: kind=pdf"), "failure did not preserve manifest")
 
+  const documentHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-document"), cacheDir: join(root, "document-cache"), enabledKinds: ["document"], extractors: { document: async () => "converted markdown" } })
+  const documentPart = part({ filename: "report.docx", path: "/x/report.docx", mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", media_kind: "document", sha256: "e".repeat(64) }, "document")
+  const documentContainer = { parts: [documentPart] }
+  await documentHooks["chat.message"]!({}, documentContainer)
+  assert(documentContainer.parts[0].text.includes("[media-preprocess extracted: kind=document") && documentContainer.parts[0].text.includes("converted markdown"), "document extraction marker or text missing")
+
+  const epubPart = part({ filename: "book.epub", path: "/x/book.epub", mime: "application/epub+zip", media_kind: "document", sha256: "f".repeat(64) }, "epub")
+  const epubContainer = { parts: [epubPart] }
+  await documentHooks["chat.message"]!({}, epubContainer)
+  assert(epubContainer.parts[0].text.includes("[media-preprocess extracted: kind=document") && !epubContainer.parts[0].text.includes("archive"), "EPUB was classified as archive")
+
+  const failingDocumentHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-document-fail"), cacheDir: join(root, "document-fail-cache"), enabledKinds: ["document"], extractors: { document: async () => { throw new Error("bad document extractor") } } })
+  const failingDocument = part({ filename: "broken.docx", path: "/x/broken.docx", mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", media_kind: "document", sha256: "1".repeat(64) }, "document-fail")
+  const failingDocumentContainer = { parts: [failingDocument] }
+  await failingDocumentHooks["chat.message"]!({}, failingDocumentContainer)
+  assert(failingDocumentContainer.parts[0].text.includes("[media-preprocess failed: kind=document") && failingDocumentContainer.parts[0].text.includes("bad document extractor"), "document failure marker missing")
+
   const limited = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-limit"), cacheDir: join(root, "cache-limit"), maxExtractedChars: 5, extractors: { pdf: async () => "123456789" } })
   const limitedPart = part({ ...manifest(), sha256: "b".repeat(64) }, "limited")
   const limitedContainer = { parts: [limitedPart] }
@@ -110,6 +127,17 @@ try {
   assert(archiveText.includes("[media-preprocess archive: entries=2 expanded=2 skipped=0 truncated=false]"), "archive summary missing")
   assert(archiveText.includes("memo from archive") && archiveText.includes('"handling":"needs-agent"'), "archive partition missing")
   assert(archiveText.includes("Dispatch `vision-reader` via `task`") && archiveText.includes("diagram.png"), "vision routing missing")
+
+  const documentArchiveDir = join(root, "document-archive-input")
+  mkdirSync(documentArchiveDir)
+  writeFileSync(join(documentArchiveDir, "report.docx"), "not a real office document")
+  const documentArchivePath = join(root, "document-bundle.zip")
+  assert(Bun.spawnSync(["zip", "-q", "-r", documentArchivePath, "."], { cwd: documentArchiveDir }).exitCode === 0, "could not create document zip")
+  const documentArchiveHooks = await MediaGuardPlugin({}, { materializationDir: join(root, "guard-document-archive"), cacheDir: join(root, "document-archive-cache"), enabledKinds: ["document", "archive"], extractors: { document: async () => "archive document markdown" } })
+  const documentArchivePart = part({ filename: "document-bundle.zip", path: documentArchivePath, mime: "application/zip", media_kind: "archive", sha256: createHash("sha256").update(readFileSync(documentArchivePath)).digest("hex") }, "document-archive")
+  const documentArchiveContainer = { parts: [documentArchivePart] }
+  await documentArchiveHooks["chat.message"]!({}, documentArchiveContainer)
+  assert(documentArchiveContainer.parts[0].text.includes('"kind":"document"') && documentArchiveContainer.parts[0].text.includes('"handling":"auto-preprocessed"') && documentArchiveContainer.parts[0].text.includes("archive document markdown"), "document archive member was not auto-preprocessed")
   const archiveAgain = archiveContainer.parts[0].text
   await archiveHooks["chat.message"]!({}, archiveContainer)
   assert(archiveContainer.parts[0].text === archiveAgain, "archive idempotency failed")
@@ -214,13 +242,13 @@ try {
   const textChat = { parts: [part(textManifest, "text-chat")] }
   await textHooks["chat.message"]!({}, textChat)
   const textChatOnce = textChat.parts[0].text
-  assert(textChatOnce.includes("[media-preprocess extracted: kind=text") && textChatOnce.includes("top-level text attachment contents"), "top-level text was not extracted in chat hook")
+  assert(textChatOnce.includes("[media-preprocess text-file:") && textChatOnce.includes(`path=${textPath}`) && !textChatOnce.includes("top-level text attachment contents"), "top-level text was not reduced to a path-only manifest in chat hook")
   await textHooks["chat.message"]!({}, textChat)
   assert(textChat.parts[0].text === textChatOnce, "top-level text chat extraction was not idempotent")
   const textTransform = { messages: [{ parts: [part(textManifest, "text-transform")] }] }
   await textHooks["experimental.chat.messages.transform"]!({}, textTransform)
   const textTransformOnce = textTransform.messages[0].parts[0].text
-  assert(textTransformOnce.includes("[media-preprocess extracted: kind=text") && textTransformOnce.includes("top-level text attachment contents"), "top-level text was not extracted in transform hook")
+  assert(textTransformOnce.includes("[media-preprocess text-file:") && textTransformOnce.includes(`path=${textPath}`) && !textTransformOnce.includes("top-level text attachment contents"), "top-level text was not reduced to a path-only manifest in transform hook")
   await textHooks["experimental.chat.messages.transform"]!({}, textTransform)
   assert(textTransform.messages[0].parts[0].text === textTransformOnce, "top-level text transform extraction was not idempotent")
 

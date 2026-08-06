@@ -35,11 +35,12 @@ Materialize-first handling for the unified Media Guard plugin: read the manifest
 | PDF | `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pdf_tool.py read-text <pdf> --format json` |
 | Image OCR | `${CLAUDE_PLUGIN_ROOT}/scripts/apple-vision-ocr <image>` |
 | Audio/video | `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/transcribe_audio.py <path> --backend auto --model turbo --formats txt --output-dir <dir>` |
+| Office document | `npx -y @firecrawl/anydoc <file>` (or the `anydoc` binary / `MEDIA_GUARD_ANYDOC`) |
 | ZIP | `unzip -Z1 <archive>` then `unzip -o <archive> -d <private-dir>` |
 | TAR/gzip/bzip2/xz | `tar -tf <archive>` then `tar -xf <archive> -C <private-dir>` |
 | 7z/RAR | `7z l -slt <archive>` then `7z x -y <archive> -o<private-dir>` when installed |
 
-Archive extraction is cached under `<cache>/<sha256>.archive/` with private directory/file permissions. Text, PDF, audio, and video members are auto-preprocessed; images and other visual members are routed, not OCR'd inline. Top-level PDF extraction also emits per-page WebP images at q75 with a 1568px long edge, and top-level video extraction emits scene-guided WebP keyframes. The strict no-nested-archive policy is deliberate: nested archive members are surfaced but never expanded.
+Archive extraction is cached under `<cache>/<sha256>.archive/` with private directory/file permissions. Text, PDF, audio, video, and document members are auto-preprocessed; images and other visual members are routed, not OCR'd inline. Top-level PDF extraction also emits per-page WebP images at q75 with a 1568px long edge, and top-level video extraction emits scene-guided WebP keyframes. The strict no-nested-archive policy is deliberate: nested archive members are surfaced but never expanded.
 
 # Troubleshooting
 

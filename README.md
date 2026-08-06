@@ -51,13 +51,15 @@ The existing dotfiles runtime supplies these values under `media_guard:` in `con
 | `maxTotalMaterializedBytes` | `524288000` | Maximum aggregate staged bytes in one transform. |
 | `maxExtractedChars` | `200000` | Maximum inline extracted characters. |
 | `timeoutMs` | `300000` | Extractor timeout in milliseconds. |
-| `enabledKinds` | `pdf,image,audio,video,text,archive` | Media kinds eligible for preprocessing. |
+| `enabledKinds` | `pdf,image,audio,video,text,document,archive` | Media kinds eligible for preprocessing. |
 | `maxExtractedFilesPerTransform` | `16` | Maximum files preprocessed from manifests/archives. |
 | `maxArchiveEntries` | `200` | Maximum archive members. |
 | `maxArchiveBytes` | `524288000` | Maximum declared and post-extraction archive bytes. |
 | `maxCompressionRatio` | `200` | Maximum declared-size to archive-size ratio. |
 | `maxPdfPageImages` | `50` | Maximum rendered PDF pages. |
 | `maxVideoKeyframes` | `20` | Maximum extracted video frames. |
+| `maxTextBytes` | `409600` | Maximum bytes read from a text attachment. |
+| `maxTextChars` | `100000` | Maximum characters extracted from a text attachment. |
 | `materializationDir` | `${TMPDIR}/opencode-media-guard` | Private attachment staging directory. |
 | `cacheDir` | `${TMPDIR}/opencode-media-preprocess` | Private extraction cache. |
 
@@ -66,6 +68,7 @@ Environment overrides:
 | Variable | Purpose |
 |---|---|
 | `MEDIA_GUARD_PYTHON` | Explicit Python executable; otherwise the repo-local `.venv/bin/python`, then `python3` from `PATH`. |
+| `MEDIA_GUARD_ANYDOC` | Explicit anydoc executable; otherwise `anydoc` from `PATH`, then `npx -y @firecrawl/anydoc`. |
 | `MEDIA_GUARD_FFMPEG` | Explicit ffmpeg executable for video keyframes. |
 | `MEDIA_GUARD_FFPROBE` | Explicit ffprobe executable for video duration. |
 | `MEDIA_GUARD_TESSERACT` | Explicit Tesseract executable for scanned-PDF OCR. |

@@ -9,7 +9,8 @@ import { tmpdir } from "node:os"
 type Limits = { maxMaterializedBytes: number; maxFilesPerTransform: number; maxTotalMaterializedBytes: number }
 type Options = Partial<Limits & PreprocessSettings> & { mimes?: string[]; materializationDir?: string; cacheDir?: string; extractors?: Partial<Record<Kind, Extractor>> }
 const TEXT_MIMES = ["application/json", "application/xml", "application/yaml", "application/x-yaml", "application/javascript", "application/x-javascript", "application/typescript", "application/toml", "application/x-ndjson", "application/x-sh"]
-const DEFAULT_MIMES = ["image/*", "application/pdf", "audio/*", "video/*", "application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed", "text/*", ...TEXT_MIMES]
+const DOCUMENT_MIMES = ["application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.ms-word.document.macroenabled.12", "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "application/vnd.openxmlformats-officedocument.presentationml.slideshow", "application/vnd.ms-powerpoint.presentation.macroenabled.12", "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.ms-excel.sheet.macroenabled.12", "application/vnd.ms-excel.sheet.binary.macroenabled.12", "application/vnd.oasis.opendocument.text", "application/vnd.oasis.opendocument.spreadsheet", "application/vnd.oasis.opendocument.presentation", "application/rtf", "text/rtf", "application/epub+zip"]
+const DEFAULT_MIMES = ["image/*", "application/pdf", "audio/*", "video/*", "application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed", "text/*", ...TEXT_MIMES, ...DOCUMENT_MIMES]
 const FALLBACKS: Limits = { maxMaterializedBytes: 100 * 1024 * 1024, maxFilesPerTransform: 64, maxTotalMaterializedBytes: 500 * 1024 * 1024 }
 const PLUGIN_PATH = realpathSync(fileURLToPath(import.meta.url))
 const PLUGIN_DIR = dirname(PLUGIN_PATH)
@@ -52,7 +53,7 @@ function matchesMime(mime: string, patterns: string[]): boolean {
   const normalized = canonicalMime(mime)
   return patterns.some(pattern => { const p = canonicalMime(pattern); return p === normalized || (p.endsWith("/*") && normalized.startsWith(p.slice(0, -1))) })
 }
-function mediaKind(mime: string): string { const normalized = canonicalMime(mime); return normalized === "application/pdf" ? "pdf" : normalized.startsWith("image/") ? "image" : normalized.startsWith("audio/") ? "audio" : normalized.startsWith("video/") ? "video" : normalized.startsWith("text/") || TEXT_MIMES.includes(normalized) ? "text" : ["application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed"].includes(normalized) ? "archive" : "file" }
+function mediaKind(mime: string): string { const normalized = canonicalMime(mime); return normalized === "application/pdf" ? "pdf" : DOCUMENT_MIMES.includes(normalized) ? "document" : normalized.startsWith("image/") ? "image" : normalized.startsWith("audio/") ? "audio" : normalized.startsWith("video/") ? "video" : normalized.startsWith("text/") || TEXT_MIMES.includes(normalized) ? "text" : ["application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed"].includes(normalized) ? "archive" : "file" }
 function safeName(value: unknown): string {
   const name = basename(typeof value === "string" ? value : "attachment").replace(/[\u0000-\u001f\u007f/\\]/g, "_").replace(/[^A-Za-z0-9._ -]/g, "_").trim()
   return name && name !== "." && name !== ".." ? name : "attachment"
@@ -92,7 +93,7 @@ function diagnosticLog(dir: string, hook: string, parts: any[], error?: unknown)
     appendFileSync(join(dir, "media-guard.log"), `${JSON.stringify(record)}\n`, { mode: 0o600 })
   } catch {}
 }
-function extension(part: any, mime: string): string { return extname(safeName(part?.filename)) || ({ "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf", "application/zip": ".zip", "application/x-zip-compressed": ".zip", "application/gzip": ".tar.gz", "application/x-gzip": ".gz", "application/x-tar": ".tar", "application/x-bzip2": ".bz2", "application/x-xz": ".xz", "application/x-7z-compressed": ".7z", "application/vnd.rar": ".rar", "application/x-rar-compressed": ".rar", "text/plain": ".txt", "text/markdown": ".md", "text/csv": ".csv", "text/html": ".html", "text/xml": ".xml", "application/json": ".json", "application/xml": ".xml", "application/yaml": ".yaml", "application/x-yaml": ".yaml", "application/javascript": ".js", "application/x-javascript": ".js", "application/typescript": ".ts", "application/toml": ".toml", "application/x-sh": ".sh" } as Record<string, string>)[canonicalMime(mime)] || ".bin" }
+function extension(part: any, mime: string): string { return extname(safeName(part?.filename)) || ({ "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf", "application/zip": ".zip", "application/x-zip-compressed": ".zip", "application/gzip": ".tar.gz", "application/x-gzip": ".gz", "application/x-tar": ".tar", "application/x-bzip2": ".bz2", "application/x-xz": ".xz", "application/x-7z-compressed": ".7z", "application/vnd.rar": ".rar", "application/x-rar-compressed": ".rar", "text/plain": ".txt", "text/markdown": ".md", "text/csv": ".csv", "text/html": ".html", "text/xml": ".xml", "application/json": ".json", "application/xml": ".xml", "application/yaml": ".yaml", "application/x-yaml": ".yaml", "application/javascript": ".js", "application/x-javascript": ".js", "application/typescript": ".ts", "application/toml": ".toml", "application/x-sh": ".sh", "application/msword": ".doc", "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx", "application/vnd.ms-word.document.macroenabled.12": ".docm", "application/vnd.ms-powerpoint": ".ppt", "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.slideshow": ".ppsx", "application/vnd.ms-powerpoint.presentation.macroenabled.12": ".pptm", "application/vnd.ms-excel": ".xls", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx", "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsm", "application/vnd.ms-excel.sheet.binary.macroenabled.12": ".xlsb", "application/vnd.oasis.opendocument.text": ".odt", "application/vnd.oasis.opendocument.spreadsheet": ".ods", "application/vnd.oasis.opendocument.presentation": ".odp", "application/rtf": ".rtf", "text/rtf": ".rtf", "application/epub+zip": ".epub" } as Record<string, string>)[canonicalMime(mime)] || ".bin" }
 function writeAll(fd: number, bytes: Buffer): void {
   let offset = 0
   while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset)
@@ -167,12 +168,12 @@ function errorPart(part: any, message: string): any {
   return { ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true }
 }
 
-type Kind = "pdf" | "image" | "audio" | "video" | "text" | "archive" | "other"
+type Kind = "pdf" | "image" | "audio" | "video" | "text" | "document" | "archive" | "other"
 type PreprocessSettings = { maxExtractedChars: number; timeoutMs: number; maxFilesPerTransform: number; enabledKinds: string[]; maxArchiveEntries: number; maxArchiveBytes: number; maxCompressionRatio: number; maxPdfPageImages: number; maxVideoKeyframes: number; maxTextBytes: number; maxTextChars: number }
 type Extractor = (path: string, timeoutMs: number) => Promise<string>
 export type MediaPreprocessOptions = Partial<PreprocessSettings> & { cacheDir?: string; extractors?: Partial<Record<Kind, Extractor>> }
 
-const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200, maxPdfPageImages: 50, maxVideoKeyframes: 20, maxTextBytes: 409600, maxTextChars: 100000 }
+const PREPROCESS_FALLBACKS: PreprocessSettings = { maxExtractedChars: 200000, timeoutMs: 300000, maxFilesPerTransform: 16, enabledKinds: ["pdf", "image", "audio", "video", "text", "document", "archive"], maxArchiveEntries: 200, maxArchiveBytes: 524288000, maxCompressionRatio: 200, maxPdfPageImages: 50, maxVideoKeyframes: 20, maxTextBytes: 409600, maxTextChars: 100000 }
 export const MARKERS = {
  extracted: "[media-preprocess extracted:",
  archive: "[media-preprocess archive:",
@@ -269,6 +270,7 @@ function executablePath(path: string, envName: string): string {
   if (!existsSync(path)) throw new Error(`${envName} points to a missing executable: ${path}`)
   return path
 }
+function anydocCommand(): string { const override = process.env.MEDIA_GUARD_ANYDOC; return override ? executablePath(override, "MEDIA_GUARD_ANYDOC") : Bun.which("anydoc") ?? "npx -y @firecrawl/anydoc" }
 const PYTHON = pythonExecutable()
 const PDF_RENDER_SCRIPT = join(SCRIPTS_DIR, "pdf_render_pages.py")
 const PDF_LONG_EDGE_PX = 1568
@@ -293,6 +295,7 @@ const defaults: Record<Kind, Extractor> = {
   image: async (path, timeout) => { const raw = await run(`${sh(join(SCRIPTS_DIR, "apple-vision-ocr"))} ${sh(path)}`, timeout); const j = JSON.parse(raw); if (j.status !== "ok" || j.error) throw new Error(j.error || `OCR status ${j.status}`); return j.text || "" },
   audio: async (path, timeout) => transcribe(path, timeout),
   video: async (path, timeout) => transcribe(path, timeout),
+  document: (() => { let command: string | undefined; return async (path: string, timeout: number) => { command ??= anydocCommand(); const out = await run(`${command} ${sh(path)}`, timeout); if (!out.trim()) throw new Error("anydoc produced no markdown"); return out } })(),
 }
 function classify(path: string, mime = ""): Kind {
   const m = mime.split(";", 1)[0].toLowerCase(), e = extname(path).toLowerCase()
@@ -300,6 +303,7 @@ function classify(path: string, mime = ""): Kind {
   if (m.startsWith("image/") || [".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp", ".tiff"].includes(e)) return "image"
   if (m.startsWith("audio/") || [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"].includes(e)) return "audio"
   if (m.startsWith("video/") || [".mp4", ".mov", ".mkv", ".webm", ".avi"].includes(e)) return "video"
+  if (DOCUMENT_MIMES.includes(m) || [".doc", ".docx", ".docm", ".ppt", ".pps", ".pot", ".pptx", ".pptm", ".ppsx", ".ppsm", ".xls", ".xlsx", ".xlsm", ".xlsb", ".odt", ".ods", ".odp", ".rtf", ".epub"].includes(e)) return "document"
   if (m.includes("zip") || m.includes("gzip") || m.includes("tar") || m.includes("bzip") || m.includes("xz") || m.includes("7z") || m.includes("rar") || [".zip", ".gz", ".tgz", ".tar", ".bz2", ".xz", ".7z", ".rar"].includes(e)) return "archive"
   if (m.startsWith("text/") || [".txt", ".md", ".csv", ".json", ".xml", ".html", ".log", ".yaml", ".yml", ".ts", ".js", ".css"].includes(e)) return "text"
   return "other"
@@ -371,7 +375,7 @@ function parseManifest(part: any): any | null {
   try { return JSON.parse(part.text.split("\n", 2)[1]) } catch { return null }
 }
 function localPath(path: unknown): asserts path is string { if (typeof path !== "string" || !path.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(path)) throw new Error("manifest path is not a local absolute path") }
-function extractorName(kind: Kind) { return kind === "pdf" ? "pdf_tool.read-text" : kind === "image" ? "apple-vision-ocr" : "transcribe_audio" }
+function extractorName(kind: Kind) { return kind === "pdf" ? "pdf_tool.read-text" : kind === "image" ? "apple-vision-ocr" : kind === "document" ? "anydoc" : "transcribe_audio" }
 async function extractText(path: string, cfg: PreprocessSettings, cache: string, knownHash?: string): Promise<{ text: string; truncated: boolean }> {
   const hash = knownHash ?? (existsSync(path) ? await hashFile(path) : ""), key = hash ? join(cache, `${hash}.text.${cfg.maxTextChars}.${cfg.maxTextBytes}.txt`) : null
   const limit = Math.min(cfg.maxTextBytes, cfg.maxTextChars * 4)
@@ -411,7 +415,7 @@ async function augmentArchive(part: any, manifest: any, cfg: PreprocessSettings,
     let used = 0, truncated = false
     for (const path of expanded.files) {
       const mime = MIME[extname(path).toLowerCase()] ?? "application/octet-stream", kind = classify(path, mime), size = statSync(path).size
-       const entry = { name: relative(expanded.root, path), path: resolve(path), mime, kind, size, handling: kind === "archive" ? "nested-archive-skipped" : ["pdf", "audio", "video", "text"].includes(kind) ? "auto-preprocessed" : "needs-agent" }
+       const entry = { name: relative(expanded.root, path), path: resolve(path), mime, kind, size, handling: kind === "archive" ? "nested-archive-skipped" : ["pdf", "audio", "video", "text", "document"].includes(kind) ? "auto-preprocessed" : "needs-agent" }
       entries.push(entry)
        if (entry.handling !== "auto-preprocessed") { if (entry.handling === "needs-agent") needs.push(entry); continue }
       try {
@@ -432,7 +436,7 @@ function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: 
   const kind = classify(manifest.path, manifest.mime) === "other" ? manifest.media_kind as Kind : classify(manifest.path, manifest.mime)
   if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
   if (kind === "archive") return augmentArchive(part, manifest, cfg, cache, extractors)
-  if (!["pdf", "image", "audio", "video", "text"].includes(kind)) return Promise.resolve(part)
+  if (!["pdf", "image", "audio", "video", "text", "document"].includes(kind)) return Promise.resolve(part)
   if (kind === "text") {
     return (async () => {
       try {
