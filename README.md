@@ -42,7 +42,7 @@ The Claude plugin manifest is `.claude-plugin/plugin.json`; its skill is auto-di
 
 ## Configuration reference
 
-The existing dotfiles runtime supplies these values under `media_guard:` in `config/agent-runtime/agent-config.yml`. Plugin options take precedence over workspace configuration.
+The existing dotfiles runtime supplies these values under `plugins.media_guard` in `config/agent-runtime/agent-config.yml`. Plugin options take precedence over workspace configuration. A missing workspace block is a hard initialization error rather than a silent fallback; individual omitted settings still use the defaults below.
 
 | Setting | Default | Meaning |
 |---|---:|---|

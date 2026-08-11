@@ -21,22 +21,30 @@ const DEFAULT_DIR = join(tmpdir(), "opencode-media-guard")
 const ATTACHMENT_READ_MARKER = "Called the Read tool with the following input:"
 
 function positive(value: unknown, fallback: number): number { return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback }
+// The workspace SOT nests this block as `plugins.media_guard`. A missing block
+// MUST throw: silently falling back to built-in defaults is how a config move
+// (or a typo) quietly slashes every limit with nothing in the logs.
+function mediaGuardSection(): string {
+  const text = readFileSync(CONFIG_PATH, "utf8")
+  const plugins = text.match(/^plugins:[ \t]*\n((?:(?:[ \t]+[^\n]*)?\n)*)/m)?.[1]
+  if (plugins === undefined) throw new Error(`media-guard: no 'plugins:' block in ${CONFIG_PATH}`)
+  const section = plugins.match(/^([ \t]+)media_guard:[ \t]*\n((?:(?:\1[ \t]+[^\n]*)?\n)*)/m)?.[2]
+  if (section === undefined) throw new Error(`media-guard: no 'plugins.media_guard:' block in ${CONFIG_PATH}`)
+  return section
+}
 function workspaceLimits(): Partial<Limits> {
-  try {
-    const text = readFileSync(CONFIG_PATH, "utf8")
-    const section = text.match(/^media_guard:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
-    const out: Partial<Limits> = {}
-    const keys: Record<keyof Limits, string> = {
-      maxMaterializedBytes: "maxMaterializedBytes",
-      maxFilesPerTransform: "maxMaterializedFilesPerTransform",
-      maxTotalMaterializedBytes: "maxTotalMaterializedBytes",
-    }
-    for (const key of Object.keys(keys) as (keyof Limits)[]) {
-      const match = section.match(new RegExp(`^\\s*${keys[key]}:\\s*(\\d+)\\s*$`, "m"))
-      if (match) out[key] = Number(match[1])
-    }
-    return out
-  } catch { return {} }
+  const section = mediaGuardSection()
+  const out: Partial<Limits> = {}
+  const keys: Record<keyof Limits, string> = {
+    maxMaterializedBytes: "maxMaterializedBytes",
+    maxFilesPerTransform: "maxMaterializedFilesPerTransform",
+    maxTotalMaterializedBytes: "maxTotalMaterializedBytes",
+  }
+  for (const key of Object.keys(keys) as (keyof Limits)[]) {
+    const match = section.match(new RegExp(`^\\s*${keys[key]}:\\s*(\\d+)\\s*$`, "m"))
+    if (match) out[key] = Number(match[1])
+  }
+  return out
 }
 function limits(opts: Options): Limits {
   const workspace = workspaceLimits()
@@ -195,29 +203,26 @@ function attachmentReadPath(part: any): string | null {
 }
 
 function workspaceConfig(): Partial<PreprocessSettings> {
-  try {
-    const text = readFileSync(CONFIG_PATH, "utf8")
-    const section = text.match(/^media_guard:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
-    const out: Partial<PreprocessSettings> = {}
-    const keys: Record<string, keyof PreprocessSettings> = {
-      maxExtractedChars: "maxExtractedChars",
-      timeoutMs: "timeoutMs",
-      maxExtractedFilesPerTransform: "maxFilesPerTransform",
-      maxArchiveEntries: "maxArchiveEntries",
-      maxArchiveBytes: "maxArchiveBytes",
-      maxCompressionRatio: "maxCompressionRatio",
-      maxPdfPageImages: "maxPdfPageImages",
-      maxVideoKeyframes: "maxVideoKeyframes",
-      maxTextBytes: "maxTextBytes",
-      maxTextChars: "maxTextChars",
-    }
-    for (const [configKey, key] of Object.entries(keys)) {
-      const m = section.match(new RegExp(`^\\s*${configKey}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
-    }
-    const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
-    const enabled = inline("enabledKinds"); if (enabled) out.enabledKinds = enabled
-    return out
-  } catch { return {} }
+  const section = mediaGuardSection()
+  const out: Partial<PreprocessSettings> = {}
+  const keys: Record<string, keyof PreprocessSettings> = {
+    maxExtractedChars: "maxExtractedChars",
+    timeoutMs: "timeoutMs",
+    maxExtractedFilesPerTransform: "maxFilesPerTransform",
+    maxArchiveEntries: "maxArchiveEntries",
+    maxArchiveBytes: "maxArchiveBytes",
+    maxCompressionRatio: "maxCompressionRatio",
+    maxPdfPageImages: "maxPdfPageImages",
+    maxVideoKeyframes: "maxVideoKeyframes",
+    maxTextBytes: "maxTextBytes",
+    maxTextChars: "maxTextChars",
+  }
+  for (const [configKey, key] of Object.entries(keys)) {
+    const m = section.match(new RegExp(`^\\s*${configKey}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
+  }
+  const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
+  const enabled = inline("enabledKinds"); if (enabled) out.enabledKinds = enabled
+  return out
 }
 function settings(opts: MediaPreprocessOptions): PreprocessSettings {
   const w = workspaceConfig()
