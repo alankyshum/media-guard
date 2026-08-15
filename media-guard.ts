@@ -1,5 +1,4 @@
 // Materialize attachments. Never inspect media content beyond staging/hash bytes.
-import type { Plugin } from "@opencode-ai/plugin"
 import { createHash } from "node:crypto"
 import { accessSync, appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, closeSync, unlinkSync, writeSync, writeFileSync, constants as fsConstants, rmSync, readdirSync } from "node:fs"
 import { basename, dirname, extname, join, resolve, relative } from "node:path"
@@ -21,22 +20,30 @@ const DEFAULT_DIR = join(tmpdir(), "opencode-media-guard")
 const ATTACHMENT_READ_MARKER = "Called the Read tool with the following input:"
 
 function positive(value: unknown, fallback: number): number { return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback }
+// The workspace SOT nests this block as `plugins.media_guard`. A missing block
+// MUST throw: silently falling back to built-in defaults is how a config move
+// (or a typo) quietly slashes every limit with nothing in the logs.
+function mediaGuardSection(): string {
+  const text = readFileSync(CONFIG_PATH, "utf8")
+  const plugins = text.match(/^plugins:[ \t]*\n((?:(?:[ \t]+[^\n]*)?\n)*)/m)?.[1]
+  if (plugins === undefined) throw new Error(`media-guard: no 'plugins:' block in ${CONFIG_PATH}`)
+  const section = plugins.match(/^([ \t]+)media_guard:[ \t]*\n((?:(?:\1[ \t]+[^\n]*)?\n)*)/m)?.[2]
+  if (section === undefined) throw new Error(`media-guard: no 'plugins.media_guard:' block in ${CONFIG_PATH}`)
+  return section
+}
 function workspaceLimits(): Partial<Limits> {
-  try {
-    const text = readFileSync(CONFIG_PATH, "utf8")
-    const section = text.match(/^media_guard:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
-    const out: Partial<Limits> = {}
-    const keys: Record<keyof Limits, string> = {
-      maxMaterializedBytes: "maxMaterializedBytes",
-      maxFilesPerTransform: "maxMaterializedFilesPerTransform",
-      maxTotalMaterializedBytes: "maxTotalMaterializedBytes",
-    }
-    for (const key of Object.keys(keys) as (keyof Limits)[]) {
-      const match = section.match(new RegExp(`^\\s*${keys[key]}:\\s*(\\d+)\\s*$`, "m"))
-      if (match) out[key] = Number(match[1])
-    }
-    return out
-  } catch { return {} }
+  const section = mediaGuardSection()
+  const out: Partial<Limits> = {}
+  const keys: Record<keyof Limits, string> = {
+    maxMaterializedBytes: "maxMaterializedBytes",
+    maxFilesPerTransform: "maxMaterializedFilesPerTransform",
+    maxTotalMaterializedBytes: "maxTotalMaterializedBytes",
+  }
+  for (const key of Object.keys(keys) as (keyof Limits)[]) {
+    const match = section.match(new RegExp(`^\\s*${keys[key]}:\\s*(\\d+)\\s*$`, "m"))
+    if (match) out[key] = Number(match[1])
+  }
+  return out
 }
 function limits(opts: Options): Limits {
   const workspace = workspaceLimits()
@@ -87,7 +94,7 @@ function diagnosticLog(dir: string, hook: string, parts: any[], error?: unknown)
       timestamp: new Date().toISOString(),
       hook,
       partCount: parts.length,
-      parts: parts.map(part => ({ type: part?.type, mime: part?.mime })),
+      parts: parts.map(part => ({ type: part?.type, mime: part?.mediaType ?? part?.mime })),
       ...(error ? { error: { message: safeError(error), stack: error instanceof Error ? error.stack : String(error) } } : {}),
     }
     appendFileSync(join(dir, "media-guard.log"), `${JSON.stringify(record)}\n`, { mode: 0o600 })
@@ -146,24 +153,38 @@ async function stageFile(input: string, filename: string, mime: string, dir: str
   } catch (error) { try { closeSync(fd) } catch {}; try { unlinkSync(temp) } catch {}; throw new Error(safeError(error)) }
 }
 async function materialize(part: any, mime: string, dir: string, max: number, remaining: number): Promise<{ path: string | null; size: number | null; sha256: string | null; source: string; error?: string }> {
-  const url = typeof part?.url === "string" ? part.url : ""
-  if (url.startsWith("data:")) {
-    const comma = url.indexOf(","); if (comma < 0) throw new Error("data URL has no payload separator")
-    const meta = url.slice(5, comma); if (!/;base64(?:;|$)/i.test(meta)) throw new Error("only base64 data URLs are supported")
-    const payload = url.slice(comma + 1); const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0
+  const data = part?.data ?? part?.source?.path ?? part?.url
+  if (data instanceof Uint8Array) return await stageBytes(Buffer.from(data), safeName(part?.filename), mime, dir, max, remaining)
+  const value = typeof data === "string" ? data : ""
+  if (value.startsWith("data:")) {
+    const comma = value.indexOf(","); if (comma < 0) throw new Error("data URL has no payload separator")
+    const meta = value.slice(5, comma); if (!/;base64(?:;|$)/i.test(meta)) throw new Error("only base64 data URLs are supported")
+    const payload = value.slice(comma + 1); const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0
     const estimatedSize = Math.floor(payload.length / 4) * 3 - padding
     if (estimatedSize > max) throw new Error(`materialized file exceeds maxMaterializedBytes (${max})`)
     if (estimatedSize > remaining) throw new Error("transform exceeds maxTotalMaterializedBytes")
     return await stageBytes(strictBase64(payload), safeName(part?.filename), mime, dir, max, remaining)
   }
-  const source = typeof part?.source?.path === "string" && part.source.path ? part.source.path : url.startsWith("file:") ? fileUrlPath(url) : url.startsWith("/") ? url : ""
+  const source = value.startsWith("file:") ? fileUrlPath(value) : value.startsWith("/") ? value : ""
   if (source) return await stageFile(source, safeName(part?.filename), mime, dir, max, remaining)
-  return { path: null, size: null, sha256: null, source: /^https?:\/\//i.test(url) ? "remote" : "unresolved", error: url ? "remote attachment was not downloaded" : "no local source" }
+  if (/^https?:\/\//i.test(value)) return { path: null, size: null, sha256: null, source: "remote", error: "remote attachment was not downloaded" }
+  if (value) {
+    let bytes: Buffer
+    try { bytes = strictBase64(value) }
+    catch { return { path: null, size: null, sha256: null, source: "unresolved", error: "unsupported media data" } }
+    return await stageBytes(bytes, safeName(part?.filename), mime, dir, max, remaining)
+  }
+  return { path: null, size: null, sha256: null, source: "unresolved", error: "no local source" }
 }
-function identity(part: any): Record<string, unknown> { return Object.fromEntries(["id", "sessionID", "messageID"].filter(k => part?.[k] !== undefined).map(k => [k, part[k]])) }
-function isMatching(part: any, patterns: string[]): boolean { return part?.type === "file" && typeof part.mime === "string" && matchesMime(part.mime, patterns) }
+function isMatching(part: any, patterns: string[]): boolean {
+  const mime = typeof part?.mediaType === "string" ? part.mediaType : part?.mime
+  return (part?.type === "media" || part?.type === "file") && typeof mime === "string" && matchesMime(mime, patterns)
+}
+function identity(part: any): Record<string, unknown> {
+  return Object.fromEntries(["id", "sessionID", "messageID"].filter(key => part?.[key] !== undefined).map(key => [key, part[key]]))
+}
 function errorPart(part: any, message: string): any {
-  const mime = typeof part?.mime === "string" ? canonicalMime(part.mime) : "application/octet-stream"
+  const mime = typeof part?.mediaType === "string" ? canonicalMime(part.mediaType) : typeof part?.mime === "string" ? canonicalMime(part.mime) : "application/octet-stream"
   const record = { schema_version: 1, filename: safeName(part?.filename), path: null, mime, media_kind: mediaKind(mime), size: null, sha256: null, source: "error", error: safeError(message) }
   return { ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true }
 }
@@ -195,29 +216,26 @@ function attachmentReadPath(part: any): string | null {
 }
 
 function workspaceConfig(): Partial<PreprocessSettings> {
-  try {
-    const text = readFileSync(CONFIG_PATH, "utf8")
-    const section = text.match(/^media_guard:\s*\n((?:^[ \t]+[^\n]*\n?)+)/m)?.[1] ?? ""
-    const out: Partial<PreprocessSettings> = {}
-    const keys: Record<string, keyof PreprocessSettings> = {
-      maxExtractedChars: "maxExtractedChars",
-      timeoutMs: "timeoutMs",
-      maxExtractedFilesPerTransform: "maxFilesPerTransform",
-      maxArchiveEntries: "maxArchiveEntries",
-      maxArchiveBytes: "maxArchiveBytes",
-      maxCompressionRatio: "maxCompressionRatio",
-      maxPdfPageImages: "maxPdfPageImages",
-      maxVideoKeyframes: "maxVideoKeyframes",
-      maxTextBytes: "maxTextBytes",
-      maxTextChars: "maxTextChars",
-    }
-    for (const [configKey, key] of Object.entries(keys)) {
-      const m = section.match(new RegExp(`^\\s*${configKey}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
-    }
-    const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
-    const enabled = inline("enabledKinds"); if (enabled) out.enabledKinds = enabled
-    return out
-  } catch { return {} }
+  const section = mediaGuardSection()
+  const out: Partial<PreprocessSettings> = {}
+  const keys: Record<string, keyof PreprocessSettings> = {
+    maxExtractedChars: "maxExtractedChars",
+    timeoutMs: "timeoutMs",
+    maxExtractedFilesPerTransform: "maxFilesPerTransform",
+    maxArchiveEntries: "maxArchiveEntries",
+    maxArchiveBytes: "maxArchiveBytes",
+    maxCompressionRatio: "maxCompressionRatio",
+    maxPdfPageImages: "maxPdfPageImages",
+    maxVideoKeyframes: "maxVideoKeyframes",
+    maxTextBytes: "maxTextBytes",
+    maxTextChars: "maxTextChars",
+  }
+  for (const [configKey, key] of Object.entries(keys)) {
+    const m = section.match(new RegExp(`^\\s*${configKey}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
+  }
+  const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
+  const enabled = inline("enabledKinds"); if (enabled) out.enabledKinds = enabled
+  return out
 }
 function settings(opts: MediaPreprocessOptions): PreprocessSettings {
   const w = workspaceConfig()
@@ -237,16 +255,28 @@ function settings(opts: MediaPreprocessOptions): PreprocessSettings {
 }
 
 function sh(value: string): string { return `'${value.replace(/'/g, `'"'"'`)}'` }
+function extractorFailure(code: number, stderr: string, stdout: string): Error {
+  const output = (stderr.trim() || stdout.trim()).replace(/\s+/g, " ")
+  const detail = output.length > 1000 ? `${output.slice(0, 490)} … ${output.slice(-490)}` : output
+  return new Error(`extractor exited with status ${code}${detail ? `: ${detail}` : " (no stderr or stdout)"}`)
+}
 function run(command: string, timeoutMs: number): Promise<string> {
   const out = join(realpathSync(tmpdir()), `opencode-media-preprocess-${process.pid}-${Math.random().toString(16).slice(2)}.out`)
+  const err = `${out}.err`
   return new Promise((ok, fail) => {
     // `exec` makes timeout kill the extractor itself rather than only its shell.
-    const child = Bun.spawn(["sh", "-c", `exec ${command} > ${sh(out)}`], { stderr: "ignore" })
+    const child = Bun.spawn(["sh", "-c", `exec ${command} > ${sh(out)} 2> ${sh(err)}`], { stderr: "ignore" })
     let timed = false
-    const timer = setTimeout(() => { timed = true; child.kill(); try { unlinkSync(out) } catch {}; fail(new Error(`extractor timed out after ${timeoutMs}ms`)) }, timeoutMs)
+    const cleanup = () => { try { unlinkSync(out) } catch {}; try { unlinkSync(err) } catch {} }
+    const timer = setTimeout(() => { timed = true; child.kill(); cleanup(); fail(new Error(`extractor timed out after ${timeoutMs}ms`)) }, timeoutMs)
     child.exited.then(code => {
       clearTimeout(timer); if (timed) return
-      try { const text = existsSync(out) ? readFileSync(out, "utf8") : ""; unlinkSync(out); if (code !== 0) fail(new Error(`extractor exited with status ${code}`)); else ok(text) } catch (e) { fail(e) }
+      try {
+        const text = existsSync(out) ? readFileSync(out, "utf8") : ""
+        const stderr = existsSync(err) ? readFileSync(err, "utf8") : ""
+        cleanup()
+        if (code !== 0) fail(extractorFailure(code, stderr, text)); else ok(text)
+      } catch (e) { cleanup(); fail(e) }
     }).catch(e => { clearTimeout(timer); fail(e) })
   })
 }
@@ -596,93 +626,130 @@ async function extractVideoKeyframes(path: string, knownHash: string | undefined
 }
 
 
-export const MediaGuardPlugin: Plugin = async (context, opts: Options = {}) => {
-  const projectRoots = [context?.directory, context?.worktree].filter((v): v is string => typeof v === "string" && !!v)
-  const configured = limits(opts); const patterns = opts.mimes ?? DEFAULT_MIMES; const dir = privateDir(opts.materializationDir ?? DEFAULT_DIR)
-  const preprocessConfig = settings(opts)
-  const preprocessCache = privateDir(opts.cacheDir ?? join(realpathSync(tmpdir()), "opencode-media-preprocess"), "cache")
-  const preprocessExtractors = { ...defaults, ...(opts.extractors ?? {}) } as Record<Kind, Extractor>
-  const preprocessParts = async (parts: any[], state = { count: 0 }): Promise<void> => {
-    const snapshot = parts.slice()
-    try {
-      const result: any[] = []
-      for (const part of snapshot) {
-        const manifest = parseManifest(part)
-        const eligible = !!manifest && !!manifest.path && !Object.prototype.hasOwnProperty.call(manifest, "error") && preprocessConfig.enabledKinds.includes(manifest.media_kind) && !processed(part.text)
-        if (eligible && state.count++ >= preprocessConfig.maxFilesPerTransform) result.push({ ...part, text: `${part.text}\n${MARKERS.failed} kind=${manifest.media_kind} reason=maxFilesPerTransform]` })
-        else result.push(await augment(part, preprocessConfig, preprocessCache, preprocessExtractors))
-      }
-      parts.splice(0, parts.length, ...result)
-    } catch (error) {
-      console.error("[media-preprocess] transform failed:", safeError(error))
-      parts.splice(0, parts.length, ...snapshot)
-    }
-  }
-  const replaceMatches = (parts: any[], message: string): void => {
-    const snapshot = parts.slice()
-    parts.splice(0, parts.length, ...snapshot.map(part => isMatching(part, patterns) ? errorPart(part, message) : part))
-  }
-  const transformParts = async (parts: any[], state = { files: 0, total: 0 }): Promise<void> => {
-    const snapshot = parts.slice()
-    const matches = snapshot.filter(part => isMatching(part, patterns))
-    if (state.files + matches.length > configured.maxFilesPerTransform) {
-      const message = `transform has more than maxFilesPerTransform (${configured.maxFilesPerTransform}) files`
-      replaceMatches(parts, message)
-      return
-    }
-    state.files += matches.length
-    const transformed: any[] = []
-    for (const part of snapshot) {
-      if (!isMatching(part, patterns)) { transformed.push(part); continue }
+export const mediaGuardSetup = async (context: any) => {
+    const opts = (context.options ?? {}) as Options
+    const configured = limits(opts); const patterns = opts.mimes ?? DEFAULT_MIMES; const dir = privateDir(opts.materializationDir ?? DEFAULT_DIR)
+    const preprocessConfig = settings(opts)
+    const preprocessCache = privateDir(opts.cacheDir ?? join(realpathSync(tmpdir()), "opencode-media-preprocess"), "cache")
+    const preprocessExtractors = { ...defaults, ...(opts.extractors ?? {}) } as Record<Kind, Extractor>
+    const snapshotParts = (parts: any[]): any[] => parts.map(part => part && typeof part === "object" ? { ...part } : part)
+    const replaceParts = (parts: any[], values: any[]): void => parts.splice(0, parts.length, ...values)
+    const sessionRoots = async (sessionID: string): Promise<string[]> => {
+      if (!sessionID) return []
       try {
-        const mime = canonicalMime(part.mime)
-        const staged = await materialize(part, mime, dir, configured.maxMaterializedBytes, configured.maxTotalMaterializedBytes - state.total)
-        state.total += staged.size ?? 0
-        const record = { schema_version: 1, filename: safeName(part.filename), path: staged.path, mime, media_kind: mediaKind(mime), size: staged.size, sha256: staged.sha256, source: staged.source, ...(staged.error ? { error: staged.error } : {}) }
-        transformed.push({ ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true })
-      } catch (error) { diagnosticLog(dir, "transformParts.error", [part], error); transformed.push(errorPart(part, error)) }
+        const session = await context.session.get({ sessionID })
+        const directory = (session as any)?.location?.directory
+        return typeof directory === "string" && directory ? [directory] : []
+      } catch (error) {
+        diagnosticLog(dir, "session.get.error", [], error)
+        return []
+      }
     }
-    parts.splice(0, parts.length, ...transformed)
-  }
-  const transformMessages = async (input: any, output: any): Promise<void> => {
-    const snapshots = new Map<any, any[]>(); const messages = Array.isArray(output?.messages) ? output.messages : []
-    const state = { files: 0, total: 0 }
-    const preprocessState = { count: 0 }
-    const receivedParts = messages.flatMap(message => Array.isArray(message?.parts) ? message.parts : [])
-    diagnosticLog(dir, "experimental.chat.messages.transform", receivedParts)
-    try {
-      for (const message of messages) if (Array.isArray(message?.parts)) snapshots.set(message, message.parts.slice())
-      const totalMatches = [...snapshots.values()].reduce((count, parts) => count + parts.filter(part => isMatching(part, patterns)).length, 0)
-      if (totalMatches > configured.maxFilesPerTransform) {
+    const preprocessParts = async (parts: any[], state = { count: 0 }): Promise<void> => {
+       const snapshot = parts.slice()
+      try {
+        const result: any[] = []
+        for (const part of snapshot) {
+          const manifest = parseManifest(part)
+          const eligible = !!manifest && !!manifest.path && !Object.prototype.hasOwnProperty.call(manifest, "error") && preprocessConfig.enabledKinds.includes(manifest.media_kind) && !processed(part.text)
+          if (eligible && state.count++ >= preprocessConfig.maxFilesPerTransform) result.push({ ...part, text: `${part.text}\n${MARKERS.failed} kind=${manifest.media_kind} reason=maxFilesPerTransform]` })
+          else result.push(await augment(part, preprocessConfig, preprocessCache, preprocessExtractors))
+        }
+        replaceParts(parts, result)
+      } catch (error) {
+        console.error("[media-preprocess] transform failed:", safeError(error))
+        replaceParts(parts, snapshot)
+      }
+    }
+    const replaceMatches = (parts: any[], message: string): void => {
+      const snapshot = parts.slice()
+      replaceParts(parts, snapshot.map(part => isMatching(part, patterns) ? errorPart(part, message) : part))
+    }
+    const transformParts = async (parts: any[], state = { files: 0, total: 0 }): Promise<void> => {
+      const snapshot = parts.slice()
+      const matches = snapshot.filter(part => isMatching(part, patterns))
+      if (state.files + matches.length > configured.maxFilesPerTransform) {
         const message = `transform has more than maxFilesPerTransform (${configured.maxFilesPerTransform}) files`
-        for (const [target, parts] of snapshots) target.parts = parts.map(part => isMatching(part, patterns) ? errorPart(part, message) : part)
+        replaceMatches(parts, message)
         return
       }
-      for (const message of messages) {
-        if (!Array.isArray(message?.parts)) continue; snapshots.set(message, message.parts.slice())
-        guardAttachmentReads(message.parts, projectRoots, dir)
-        await transformParts(message.parts, state)
-        await preprocessParts(message.parts, preprocessState)
+      state.files += matches.length
+      const transformed: any[] = []
+      for (const part of snapshot) {
+        if (!isMatching(part, patterns)) { transformed.push(part); continue }
+        try {
+           const mime = canonicalMime(part.mediaType ?? part.mime)
+          const staged = await materialize(part, mime, dir, configured.maxMaterializedBytes, configured.maxTotalMaterializedBytes - state.total)
+          state.total += staged.size ?? 0
+          const record = { schema_version: 1, filename: safeName(part.filename), path: staged.path, mime, media_kind: mediaKind(mime), size: staged.size, sha256: staged.sha256, source: staged.source, ...(staged.error ? { error: staged.error } : {}) }
+            transformed.push({ ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true })
+        } catch (error) { diagnosticLog(dir, "transformParts.error", [part], error); transformed.push(errorPart(part, error)) }
       }
-    } catch (error) {
-      diagnosticLog(dir, "experimental.chat.messages.transform.error", receivedParts, error)
-      console.error("[media-guard] transform failed:", safeError(error))
-      for (const [message, parts] of snapshots) message.parts = parts.map(part => isMatching(part, patterns) ? errorPart(part, error) : part)
+      replaceParts(parts, transformed)
     }
-  }
-  const transformChatMessage = async (_input: any, output: any): Promise<void> => {
-    const parts = Array.isArray(output?.parts) ? output.parts : null
-    diagnosticLog(dir, "chat.message", parts ?? [])
-    if (!parts) return
-    const snapshot = parts.slice()
-    try { guardAttachmentReads(parts, projectRoots, dir); await transformParts(parts); await preprocessParts(parts) }
-    catch (error) {
-      diagnosticLog(dir, "chat.message.error", parts, error)
-      console.error("[media-guard] chat.message transform failed:", safeError(error))
-      parts.splice(0, parts.length, ...snapshot.map(part => isMatching(part, patterns) ? errorPart(part, error) : part))
+    const transformMessages = async (event: any, output?: any): Promise<void> => {
+       const payload = output ?? event
+       const snapshots = new Map<any, any[]>()
+        const messages = Array.isArray(payload?.messages) ? payload.messages : []
+      const state = { files: 0, total: 0 }
+      const preprocessState = { count: 0 }
+       const receivedParts = messages.flatMap((message: any) => Array.isArray(message?.parts) ? message.parts : Array.isArray(message?.content) ? message.content : [])
+       try {
+         const projectRoots = await sessionRoots(typeof event?.sessionID === "string" ? event.sessionID : "")
+         for (const message of messages) {
+           const parts = Array.isArray(message?.parts) ? message.parts : message?.content
+            if (Array.isArray(parts)) snapshots.set(message, parts.slice())
+         }
+        const totalMatches = [...snapshots.values()].reduce((count, parts) => count + parts.filter(part => isMatching(part, patterns)).length, 0)
+        if (totalMatches > configured.maxFilesPerTransform) {
+          const message = `transform has more than maxFilesPerTransform (${configured.maxFilesPerTransform}) files`
+           for (const [target, parts] of snapshots) {
+             const targetParts = Array.isArray(target?.parts) ? target.parts : target?.content
+             if (Array.isArray(targetParts)) replaceParts(targetParts, parts.map(part => isMatching(part, patterns) ? errorPart(part, message) : part))
+           }
+          return
+        }
+         for (const message of messages) {
+           const parts = Array.isArray(message?.parts) ? message.parts : message?.content
+           if (!Array.isArray(parts)) continue
+            const original = snapshots.get(message) ?? parts.slice()
+           snapshots.set(message, original)
+           guardAttachmentReads(parts, projectRoots, dir)
+           await transformParts(parts, state)
+           await preprocessParts(parts, preprocessState)
+         }
+      } catch (error) {
+        diagnosticLog(dir, "session.context.error", receivedParts, error)
+        console.error("[media-guard] transform failed:", safeError(error))
+         for (const [message, parts] of snapshots) {
+           const target = Array.isArray(message?.parts) ? message.parts : message?.content
+           if (Array.isArray(target)) replaceParts(target, parts)
+         }
+      }
     }
-  }
-  return { "chat.message": transformChatMessage, "experimental.chat.messages.transform": async (input: any, output: any) => transformMessages(input, output) }
+    const transformChatMessage = async (_input: any, output: any): Promise<void> => {
+      const parts = Array.isArray(output?.parts) ? output.parts : null
+      if (!parts) return
+      const snapshot = snapshotParts(parts)
+      try {
+        guardAttachmentReads(parts, [], dir)
+        await transformParts(parts)
+        await preprocessParts(parts)
+      } catch (error) {
+        diagnosticLog(dir, "chat.message.error", parts, error)
+        replaceParts(parts, snapshot)
+      }
+    }
+    const hooks = { "chat.message": transformChatMessage, "experimental.chat.messages.transform": async (_input: any, output: any) => transformMessages(_input, output) }
+    if (context?.session?.hook) {
+      const registration = await context.session.hook("context", transformMessages)
+      ;(hooks as any).dispose = () => registration.dispose()
+    }
+    return hooks
 }
+
+// Compatibility export for direct consumers/tests.
+export const MediaGuardPlugin = async (context: any, options: Options = {}) =>
+  mediaGuardSetup({ ...context, options })
 
 export default MediaGuardPlugin

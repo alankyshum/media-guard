@@ -21,9 +21,10 @@ Supported sources: `source.path`, absolute local paths, `file://` URLs, base64
 temporary directory using a hash-derived stable filename. Only bytes required
 to decode/write data URLs or compute the manifest hash are read.
 
-Limits use explicit plugin options first, then `media_guard` in
-`config/agent-runtime/agent-config.yml`, then built-in fallbacks:
-`maxMaterializedBytes`, `maxFilesPerTransform`, and
+Limits use explicit plugin options first, then `plugins.media_guard` in
+`config/agent-runtime/agent-config.yml`, then per-setting built-in fallbacks.
+The workspace block itself is required and a missing block fails initialization
+loudly. Settings include `maxMaterializedBytes`, `maxFilesPerTransform`, and
 `maxTotalMaterializedBytes`. The materialization directory and files are
 created with `0700` and `0600` permissions and local source symlinks are
 rejected.
