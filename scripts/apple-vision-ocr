@@ -26,7 +26,11 @@ if [ "$check" -eq 1 ]; then
   printf '%s\n' 'Apple Vision OCR available'
   exit 0
 fi
+set +e
 json=$($bin "$@")
+code=$?
+set -e
+if [ "$code" -ne 0 ]; then printf '%s\n' "$json" >&2; exit "$code"; fi
 if [ "$format" = json ]; then printf '%s\n' "$json"; exit 0; fi
 # JSON is a YAML 1.2 document. This preserves empty list/map types, Unicode,
 # multiline strings, quotes, and exact OCR text without a partial YAML emitter.
