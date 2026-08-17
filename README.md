@@ -2,6 +2,9 @@
 
 Media Guard materializes local attachments into private, permission-restricted staging, emits a bounded manifest, and preprocesses PDFs, images, audio, video, and archives. It keeps text extraction and visual evidence routing separate: rendered PDF pages and scene-guided video keyframes are handed to `vision-reader` rather than guessed at by the plugin.
 
+<img width="1344" height="752" alt="file-c05fdbb317c0bb4c7e30839fe61ffcdf" src="https://github.com/user-attachments/assets/d7d45baf-936b-4ac7-bcf5-063b88c1b0d2" />
+
+
 ## Install for opencode
 
 From this repository, install the Python dependencies once:
