@@ -2,7 +2,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun verify_120.mjs && bun verify_media_guard_config.mjs && bun verify_workspace_config.mjs"
+    "test": "bun setup-regression.test.mjs && bun verify_120.mjs && bun verify_media_guard_config.mjs && bun verify_workspace_config.mjs"
   },
   "dependencies": {
     "bun": "latest"

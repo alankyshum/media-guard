@@ -40,17 +40,17 @@ def transcribe(
 
     if not mlx_available and not openai_available:
         print("Error: Neither mlx_whisper nor openai-whisper package is installed.", file=sys.stderr)
-        print("Install with: pip install mlx-whisper or pip install openai-whisper", file=sys.stderr)
+        print("Install with: scripts/setup.sh (or uv pip install --python <venv>/bin/python mlx-whisper|openai-whisper).", file=sys.stderr)
         sys.exit(1)
 
     if backend == "mlx" and not mlx_available:
         print("Error: mlx_whisper package is not installed.", file=sys.stderr)
-        print("Install with: pip install mlx-whisper", file=sys.stderr)
+        print("Install with: scripts/setup.sh (or uv pip install --python <venv>/bin/python mlx-whisper).", file=sys.stderr)
         sys.exit(1)
 
     if backend == "openai" and not openai_available:
         print("Error: whisper package is not installed.", file=sys.stderr)
-        print("Install with: pip install openai-whisper", file=sys.stderr)
+        print("Install with: scripts/setup.sh (or uv pip install --python <venv>/bin/python openai-whisper).", file=sys.stderr)
         sys.exit(1)
 
     model_name = model_size if model_size else "base"

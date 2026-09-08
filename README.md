@@ -13,6 +13,10 @@ From this repository, install the Python dependencies once:
 ./external/media-guard/scripts/setup.sh
 ```
 
+Setup uses uv's shared `$HOME/.cache/uv` and requests `hardlink` mode by default. It finds uv on `PATH`, then only at the conventional `$HOME/.local/bin/uv` fallback (suitable for launchd); otherwise it fails with install guidance. Set `UV_LINK_MODE` and `UV_CACHE_DIR` as needed. `hardlink` and APFS `clone` require the cache and venv to be on the same filesystem: setup reports requested and preflight-selected modes, selecting `copy` across filesystems; `symlink` does not have that filesystem constraint. Do not mutate installed files in `.venv` directly when hardlinks are selected; change `scripts/requirements.txt` and rerun setup instead. A healthy venv with the same bootstrap Python minor version is retained. During a rebuild, the old venv is renamed to a rollback backup; setup recreates and validates at the exact final path, then removes the backup only after success. Python venv entry points embed their absolute creation path, making a sibling temporary venv unsafe to atomically rename. A non-venv `MEDIA_GUARD_VENV` path is refused rather than removed.
+
+To restore a pilot backup, stop users of the environment, then run from this repository: `rm -rf "$PWD/.venv" && ditto "/absolute/path/to/media-guard.venv" "$PWD/.venv"`. Restore to this same absolute path: venv scripts can embed it. `ditto` restores a separate copy, so it consumes storage in addition to the retained backup.
+
 Add the plugin path to `config/opencode/opencode.jsonc` (the dotfiles configuration already does this):
 
 ```jsonc
