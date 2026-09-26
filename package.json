@@ -1,0 +1,15 @@
+{
+  "name": "opencode-media-guard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.18",
+    "@types/bun": "1.3.14",
+    "@types/node": "24.12.2",
+    "typescript": "5.8.2"
+  }
+}

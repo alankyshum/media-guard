@@ -22,9 +22,24 @@ const partsText = (output: any) => output.parts.filter((p: any) => typeof p.text
 const attachment = (id: string, filename: string, mime: string, path: string) => ({ id, type: "file", filename, mime, source: { path } })
 
 async function realPipeline(file: any, cacheName: string): Promise<string> {
-  const plugin = await MediaGuardPlugin({}, { materializationDir: join(root, `${cacheName}-guard`), cacheDir: join(root, `${cacheName}-preprocess`), timeoutMs: 300000 })
+  let transform: (event: any) => Promise<void>
+  const dispose = await (MediaGuardPlugin as any).setup({
+    options: { materializationDir: join(root, `${cacheName}-guard`), cacheDir: join(root, `${cacheName}-preprocess`), timeoutMs: 300000 },
+    location: { directory: root },
+    session: {
+      hook: async (name: string, callback: (event: any) => Promise<void>) => {
+        if (name === "context") transform = callback
+        return { dispose: async () => {} }
+      },
+      get: async () => ({ location: { directory: root } }),
+    },
+  })
   const output = { parts: [{ id: "u1", type: "text", text: "what is the total on this invoice?" }, file] }
-  await plugin["chat.message"]!({}, output)
+  try {
+    await transform!({ sessionID: `e2e-${cacheName}`, messages: [{ parts: output.parts }] })
+  } finally {
+    await dispose?.()
+  }
   return partsText(output)
 }
 

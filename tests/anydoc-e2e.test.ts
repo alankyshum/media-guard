@@ -11,6 +11,25 @@ let fixtures = process.env.ANYDOC_REAL_FIXTURES ?? "/tmp/anydoc-real"
 const assert = (value: unknown, message: string) => { if (!value) throw new Error(message) }
 const partsText = (output: any) => output.parts.filter((p: any) => typeof p.text === "string").map((p: any) => p.text).join("\n")
 const attachment = (id: string, filename: string, mime: string, path: string) => ({ id, type: "file", filename, mime, source: { path } })
+async function transformContext(options: Record<string, unknown>, output: any): Promise<void> {
+  let transform: (event: any) => Promise<void>
+  const dispose = await (MediaGuardPlugin as any).setup({
+    options,
+    location: { directory: root },
+    session: {
+      hook: async (name: string, callback: (event: any) => Promise<void>) => {
+        if (name === "context") transform = callback
+        return { dispose: async () => {} }
+      },
+      get: async () => ({ location: { directory: root } }),
+    },
+  })
+  try {
+    await transform!({ sessionID: "anydoc-test", messages: [{ parts: output.parts }] })
+  } finally {
+    await dispose?.()
+  }
+}
 const file = (name: string) => join(fixtures, name)
 const mimes: Record<string, string> = { docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation", odt: "application/vnd.oasis.opendocument.text", ods: "application/vnd.oasis.opendocument.spreadsheet", odp: "application/vnd.oasis.opendocument.presentation", rtf: "application/rtf", epub: "application/epub+zip", csv: "text/csv" }
 const output = (result: ReturnType<typeof Bun.spawnSync>) => `${result.stdout}`.trim() || `${result.stderr}`.trim()
@@ -70,9 +89,8 @@ function encryptedFixture(): string | null {
   return target
 }
 async function pipeline(part: any, name: string) {
-  const plugin = await MediaGuardPlugin({}, { materializationDir: join(root, `${name}-stage`), cacheDir: join(root, `${name}-cache`), timeoutMs: 300000 })
   const output = { parts: [{ type: "text", text: "Please inspect attachment." }, part] }
-  await plugin["chat.message"]!({}, output)
+  await transformContext({ materializationDir: join(root, `${name}-stage`), cacheDir: join(root, `${name}-cache`), timeoutMs: 300000 }, output)
   return partsText(output)
 }
 try {
@@ -116,8 +134,7 @@ try {
     const mixed = await pipeline({ type: "file", filename: "quarterly-report-encrypted.docx", mime: mimes.docx, source: { path: encrypted } }, "encrypted")
     assert(mixed.includes("[media-preprocess failed: kind=document") && mixed.includes("[media-preprocess text-file:") === false, `encrypted document was not contained: ${mixed}`)
     const mixedParts = { parts: [{ type: "text", text: "Please inspect attachments." }, { type: "file", filename: "quarterly-report-encrypted.docx", mime: mimes.docx, source: { path: encrypted } }, attachment("csv", "quarterly-report.csv", mimes.csv, file("quarterly-report.csv"))] }
-    const mixedPlugin = await MediaGuardPlugin({}, { materializationDir: join(root, "encrypted-mixed-stage"), cacheDir: join(root, "encrypted-mixed-cache"), timeoutMs: 300000 })
-    await mixedPlugin["chat.message"]!({}, mixedParts)
+    await transformContext({ materializationDir: join(root, "encrypted-mixed-stage"), cacheDir: join(root, "encrypted-mixed-cache"), timeoutMs: 300000 }, mixedParts)
     const mixedOutput = partsText(mixedParts)
     assert(mixedOutput.includes("[media-preprocess failed: kind=document") && mixedOutput.includes("[media-preprocess text-file:"), `mixed encrypted transform lost other part: ${mixedOutput}`)
     console.log("PASS encrypted docx: direct anydoc failure and contained mixed pipeline failure")

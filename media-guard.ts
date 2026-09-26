@@ -4,6 +4,7 @@ import { accessSync, appendFileSync, chmodSync, createReadStream, existsSync, ls
 import { basename, dirname, extname, join, resolve, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
+import type { Plugin as PluginDefinition } from "@opencode/plugin/promise/plugin"
 
 type Limits = { maxMaterializedBytes: number; maxFilesPerTransform: number; maxTotalMaterializedBytes: number }
 type Options = Partial<Limits & PreprocessSettings> & { mimes?: string[]; materializationDir?: string; cacheDir?: string; extractors?: Partial<Record<Kind, Extractor>> }
@@ -231,7 +232,7 @@ function workspaceConfig(): Partial<PreprocessSettings> {
     maxTextChars: "maxTextChars",
   }
   for (const [configKey, key] of Object.entries(keys)) {
-    const m = section.match(new RegExp(`^\\s*${configKey}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key] = Number(m[1])
+    const m = section.match(new RegExp(`^\\s*${configKey}:\\s*(\\d+)\\s*$`, "m")); if (m) out[key as Exclude<keyof PreprocessSettings, "enabledKinds">] = Number(m[1])
   }
   const inline = (key: string): string[] | undefined => { const m = section.match(new RegExp(`^\\s*${key}:\\s*\\[([^\\]]*)\\]`, "m")); return m ? m[1].split(",").map(v => v.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean) : undefined }
   const enabled = inline("enabledKinds"); if (enabled) out.enabledKinds = enabled
@@ -307,7 +308,7 @@ const PDF_LONG_EDGE_PX = 1568
 const VIDEO_KEYFRAME_SCRIPT = join(SCRIPTS_DIR, "video_keyframes.py")
 const VIDEO_LONG_EDGE_PX = 1568
 
-const defaults: Record<Kind, Extractor> = {
+const defaults: Partial<Record<Kind, Extractor>> = {
   pdf: async (path, timeout) => {
     const py = PYTHON, script = join(SCRIPTS_DIR, "pdf_tool.py")
     const raw = await run(`${sh(py)} ${sh(script)} read-text ${sh(path)} --format json`, timeout)
@@ -429,16 +430,17 @@ async function extractText(path: string, cfg: PreprocessSettings, cache: string,
   if (key) { writeFileSync(key, full, { mode: 0o600 }); chmodSync(key, 0o600) }
   return { text, truncated }
 }
-async function extractOne(kind: Kind, path: string, mime: string, cfg: PreprocessSettings, cache: string, extractors: Record<Kind, Extractor>, knownHash?: string): Promise<string> {
+async function extractOne(kind: Kind, path: string, mime: string, cfg: PreprocessSettings, cache: string, extractors: Partial<Record<Kind, Extractor>>, knownHash?: string): Promise<string> {
   if (kind === "text") return (await extractText(path, cfg, cache, knownHash)).text
   const hash = knownHash ?? (existsSync(path) ? await hashFile(path) : ""), key = hash ? join(cache, `${hash}.${kind}.txt`) : null
   if (key && existsSync(key)) { chmodSync(key, 0o600); return readFileSync(key, "utf8") }
-  if (!(kind in extractors)) return ""
-  const text = await extractors[kind](path, cfg.timeoutMs)
+  const extractor = extractors[kind]
+  if (!extractor) return ""
+  const text = await extractor(path, cfg.timeoutMs)
   if (key) { writeFileSync(key, text, { mode: 0o600 }); chmodSync(key, 0o600) }
   return text
 }
-async function augmentArchive(part: any, manifest: any, cfg: PreprocessSettings, cache: string, extractors: Record<Kind, Extractor>): Promise<any> {
+async function augmentArchive(part: any, manifest: any, cfg: PreprocessSettings, cache: string, extractors: Partial<Record<Kind, Extractor>>): Promise<any> {
   try {
     localPath(manifest.path)
     const expanded = await expandArchive(manifest.path, manifest.mime, cfg, cache), entries: any[] = [], auto: string[] = [], needs: any[] = []
@@ -461,7 +463,7 @@ async function augmentArchive(part: any, manifest: any, cfg: PreprocessSettings,
     return { ...part, text: `${part.text}\n${block.join("\n")}` }
   } catch (e) { return { ...part, text: `${part.text}\n${MARKERS.archiveFailed} reason=${safeError(e)}]` } }
 }
-function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: Record<Kind, Extractor>): Promise<any> {
+function augment(part: any, cfg: PreprocessSettings, cache: string, extractors: Partial<Record<Kind, Extractor>>): Promise<any> {
   const manifest = parseManifest(part); if (!manifest || !manifest.path || Object.prototype.hasOwnProperty.call(manifest, "error") || processed(part.text)) return Promise.resolve(part)
   const kind = classify(manifest.path, manifest.mime) === "other" ? manifest.media_kind as Kind : classify(manifest.path, manifest.mime)
   if (!cfg.enabledKinds.includes(kind)) return Promise.resolve(part)
@@ -626,14 +628,16 @@ async function extractVideoKeyframes(path: string, knownHash: string | undefined
 }
 
 
-export const mediaGuardSetup = async (context: any) => {
+const MediaGuardPlugin = {
+  id: "media-guard",
+  async setup(context: Parameters<PluginDefinition["setup"]>[0]) {
     const opts = (context.options ?? {}) as Options
     const configured = limits(opts); const patterns = opts.mimes ?? DEFAULT_MIMES; const dir = privateDir(opts.materializationDir ?? DEFAULT_DIR)
     const preprocessConfig = settings(opts)
     const preprocessCache = privateDir(opts.cacheDir ?? join(realpathSync(tmpdir()), "opencode-media-preprocess"), "cache")
-    const preprocessExtractors = { ...defaults, ...(opts.extractors ?? {}) } as Record<Kind, Extractor>
+    const preprocessExtractors = { ...defaults, ...(opts.extractors ?? {}) }
     const snapshotParts = (parts: any[]): any[] => parts.map(part => part && typeof part === "object" ? { ...part } : part)
-    const replaceParts = (parts: any[], values: any[]): void => parts.splice(0, parts.length, ...values)
+    const replaceParts = (parts: any[], values: any[]): void => { parts.splice(0, parts.length, ...values) }
     const sessionRoots = async (sessionID: string): Promise<string[]> => {
       if (!sessionID) return []
       try {
@@ -687,8 +691,8 @@ export const mediaGuardSetup = async (context: any) => {
       }
       replaceParts(parts, transformed)
     }
-    const transformMessages = async (event: any, output?: any): Promise<void> => {
-       const payload = output ?? event
+    const transformMessages = async (event: any): Promise<void> => {
+       const payload = event
        const snapshots = new Map<any, any[]>()
         const messages = Array.isArray(payload?.messages) ? payload.messages : []
       const state = { files: 0, total: 0 }
@@ -727,29 +731,41 @@ export const mediaGuardSetup = async (context: any) => {
          }
       }
     }
-    const transformChatMessage = async (_input: any, output: any): Promise<void> => {
-      const parts = Array.isArray(output?.parts) ? output.parts : null
-      if (!parts) return
-      const snapshot = snapshotParts(parts)
+    const transformPrompt = async (event: any): Promise<void> => {
+      const files = Array.isArray(event?.prompt?.files) ? event.prompt.files : []
+      if (!files.length) return
+      const parts = files.map((file: any) => {
+        const uri = typeof file?.uri === "string" ? file.uri : ""
+        const path = uri.startsWith("/") && !uri.startsWith("//") ? uri : ""
+        const filename = typeof file?.name === "string" ? file.name : basename(path || "attachment")
+        const mime = MIME[extname(filename).toLowerCase()] ?? "application/octet-stream"
+        return { type: "file", filename, mime, ...(path ? { source: { path } } : {}), url: uri }
+      })
+      const snapshot = files.slice()
       try {
-        guardAttachmentReads(parts, [], dir)
         await transformParts(parts)
-        await preprocessParts(parts)
+        const converted = parts.map((part: any, index: number) => ({ part, file: snapshot[index] }))
+        const manifests = converted.filter(({ part }) => part?.type === "text" && typeof part.text === "string")
+        const retained = converted.filter(({ part }) => part?.type === "file")
+        if (manifests.length) {
+          const preprocessable = manifests.map(({ part }) => part)
+          await preprocessParts(preprocessable)
+          manifests.forEach((entry, index) => { entry.part = preprocessable[index] })
+          event.prompt.text = `${event.prompt.text ?? ""}\n\n${manifests.map(({ part }) => part.text).join("\n\n")}`
+          event.prompt.files = retained.map(({ file }) => file)
+        }
       } catch (error) {
-        diagnosticLog(dir, "chat.message.error", parts, error)
-        replaceParts(parts, snapshot)
+        diagnosticLog(dir, "session.prompt.error", parts, error)
+        event.prompt.files = snapshot
       }
     }
-    const hooks = { "chat.message": transformChatMessage, "experimental.chat.messages.transform": async (_input: any, output: any) => transformMessages(_input, output) }
-    if (context?.session?.hook) {
-      const registration = await context.session.hook("context", transformMessages)
-      ;(hooks as any).dispose = () => registration.dispose()
-    }
-    return hooks
-}
+    const registrations = await Promise.all([
+      context.session.hook("prompt", transformPrompt),
+      context.session.hook("context", transformMessages),
+    ])
+    return async () => { await Promise.all(registrations.map((registration: any) => registration?.dispose?.())) }
+  },
+} satisfies PluginDefinition
 
-// Compatibility export for direct consumers/tests.
-export const MediaGuardPlugin = async (context: any, options: Options = {}) =>
-  mediaGuardSetup({ ...context, options })
-
+export { MediaGuardPlugin }
 export default MediaGuardPlugin

@@ -15,13 +15,29 @@ async function fixture(config) {
   writeFileSync(join(root, "config", "agent-runtime", "agent-config.yml"), config)
   const url = `${pathToFileURL(join(pluginDir, "media-guard.ts"))}?fixture=${Date.now()}-${Math.random()}`
   const module = await import(url)
-  return { root, create: module.default }
+  return { root, plugin: module.default }
+}
+
+async function setup(plugin, root, options = {}) {
+  let context
+  const dispose = await plugin.setup({
+    options,
+    location: { directory: root },
+    session: {
+      hook: async (name, callback) => {
+        if (name === "context") context = callback
+        return { dispose: async () => {} }
+      },
+      get: async () => ({ location: { directory: root } }),
+    },
+  })
+  return { context, dispose }
 }
 
 {
-  const { root, create } = await fixture("harnesses: [opencode, omp]\n")
+  const { root, plugin } = await fixture("harnesses: [opencode, omp]\n")
   try {
-    await create({ directory: root, worktree: root })
+    await setup(plugin, root)
     throw new Error("missing plugins.media_guard did not fail")
   } catch (error) {
     if (!String(error).includes("plugins:")) throw error
@@ -31,17 +47,17 @@ async function fixture(config) {
 }
 
 {
-  const { root, create } = await fixture(`plugins:
+  const { root, plugin } = await fixture(`plugins:
   media_guard:
     maxMaterializedFilesPerTransform: 1
 `)
   try {
-    const hooks = await create({ directory: root, worktree: root })
+    const hooks = await setup(plugin, root)
     const parts = [
       { type: "file", mime: "image/png", filename: "one.png", url: "data:image/png;base64,AA==" },
       { type: "file", mime: "image/png", filename: "two.png", url: "data:image/png;base64,AA==" },
     ]
-    await hooks["chat.message"]({}, { parts })
+    await hooks.context({ sessionID: "config-test", messages: [{ parts }] })
     for (const part of parts) {
       if (!part.text?.includes("maxFilesPerTransform (1)")) {
         throw new Error(`nested maxMaterializedFilesPerTransform was not applied: ${JSON.stringify(part)}`)
