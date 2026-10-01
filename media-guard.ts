@@ -154,9 +154,11 @@ async function stageFile(input: string, filename: string, mime: string, dir: str
   } catch (error) { try { closeSync(fd) } catch {}; try { unlinkSync(temp) } catch {}; throw new Error(safeError(error)) }
 }
 async function materialize(part: any, mime: string, dir: string, max: number, remaining: number): Promise<{ path: string | null; size: number | null; sha256: string | null; source: string; error?: string }> {
-  const data = part?.data ?? part?.source?.path ?? part?.url
-  if (data instanceof Uint8Array) return await stageBytes(Buffer.from(data), safeName(part?.filename), mime, dir, max, remaining)
-  const value = typeof data === "string" ? data : ""
+  const sourceData = part?.media?.source
+  const data = part?.data ?? part?.source?.path ?? part?.url ?? part?.uri ?? sourceData?.data ?? sourceData?.url
+  const filename = safeName(part?.filename ?? part?.name)
+  if (data instanceof Uint8Array) return await stageBytes(Buffer.from(data), filename, mime, dir, max, remaining)
+  const value = typeof data === "string" ? sourceData?.type === "base64" ? `data:${mime};base64,${data}` : data : ""
   if (value.startsWith("data:")) {
     const comma = value.indexOf(","); if (comma < 0) throw new Error("data URL has no payload separator")
     const meta = value.slice(5, comma); if (!/;base64(?:;|$)/i.test(meta)) throw new Error("only base64 data URLs are supported")
@@ -164,29 +166,33 @@ async function materialize(part: any, mime: string, dir: string, max: number, re
     const estimatedSize = Math.floor(payload.length / 4) * 3 - padding
     if (estimatedSize > max) throw new Error(`materialized file exceeds maxMaterializedBytes (${max})`)
     if (estimatedSize > remaining) throw new Error("transform exceeds maxTotalMaterializedBytes")
-    return await stageBytes(strictBase64(payload), safeName(part?.filename), mime, dir, max, remaining)
+    return await stageBytes(strictBase64(payload), filename, mime, dir, max, remaining)
   }
   const source = value.startsWith("file:") ? fileUrlPath(value) : value.startsWith("/") ? value : ""
-  if (source) return await stageFile(source, safeName(part?.filename), mime, dir, max, remaining)
+  if (source) return await stageFile(source, filename, mime, dir, max, remaining)
   if (/^https?:\/\//i.test(value)) return { path: null, size: null, sha256: null, source: "remote", error: "remote attachment was not downloaded" }
   if (value) {
     let bytes: Buffer
     try { bytes = strictBase64(value) }
     catch { return { path: null, size: null, sha256: null, source: "unresolved", error: "unsupported media data" } }
-    return await stageBytes(bytes, safeName(part?.filename), mime, dir, max, remaining)
+    return await stageBytes(bytes, filename, mime, dir, max, remaining)
   }
   return { path: null, size: null, sha256: null, source: "unresolved", error: "no local source" }
 }
+function partMime(part: any): string {
+  const mime = part?.mediaType ?? part?.mime ?? part?.media?.mediaType ?? part?.media?.source?.mediaType
+  return typeof mime === "string" ? canonicalMime(mime) : "application/octet-stream"
+}
 function isMatching(part: any, patterns: string[]): boolean {
-  const mime = typeof part?.mediaType === "string" ? part.mediaType : part?.mime
+  const mime = partMime(part)
   return (part?.type === "media" || part?.type === "file") && typeof mime === "string" && matchesMime(mime, patterns)
 }
 function identity(part: any): Record<string, unknown> {
   return Object.fromEntries(["id", "sessionID", "messageID"].filter(key => part?.[key] !== undefined).map(key => [key, part[key]]))
 }
 function errorPart(part: any, message: string): any {
-  const mime = typeof part?.mediaType === "string" ? canonicalMime(part.mediaType) : typeof part?.mime === "string" ? canonicalMime(part.mime) : "application/octet-stream"
-  const record = { schema_version: 1, filename: safeName(part?.filename), path: null, mime, media_kind: mediaKind(mime), size: null, sha256: null, source: "error", error: safeError(message) }
+  const mime = partMime(part)
+  const record = { schema_version: 1, filename: safeName(part?.filename ?? part?.name), path: null, mime, media_kind: mediaKind(mime), size: null, sha256: null, source: "error", error: safeError(message) }
   return { ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true }
 }
 
@@ -682,53 +688,51 @@ const MediaGuardPlugin = {
       for (const part of snapshot) {
         if (!isMatching(part, patterns)) { transformed.push(part); continue }
         try {
-           const mime = canonicalMime(part.mediaType ?? part.mime)
+           const mime = partMime(part)
           const staged = await materialize(part, mime, dir, configured.maxMaterializedBytes, configured.maxTotalMaterializedBytes - state.total)
           state.total += staged.size ?? 0
-          const record = { schema_version: 1, filename: safeName(part.filename), path: staged.path, mime, media_kind: mediaKind(mime), size: staged.size, sha256: staged.sha256, source: staged.source, ...(staged.error ? { error: staged.error } : {}) }
+          const record = { schema_version: 1, filename: safeName(part.filename ?? part.name), path: staged.path, mime, media_kind: mediaKind(mime), size: staged.size, sha256: staged.sha256, source: staged.source, ...(staged.error ? { error: staged.error } : {}) }
             transformed.push({ ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true })
         } catch (error) { diagnosticLog(dir, "transformParts.error", [part], error); transformed.push(errorPart(part, error)) }
       }
       replaceParts(parts, transformed)
     }
     const transformMessages = async (event: any): Promise<void> => {
-       const payload = event
-       const snapshots = new Map<any, any[]>()
-        const messages = Array.isArray(payload?.messages) ? payload.messages : []
+      const messages = Array.isArray(event?.messages) ? event.messages : []
+      const snapshots = new Map<any[], any[]>()
+      const collect = (parts: any[]): void => {
+        if (snapshots.has(parts)) return
+        snapshots.set(parts, parts.slice())
+        for (const part of parts) {
+          if (part?.type === "tool-result" && part.result?.type === "content" && Array.isArray(part.result.value)) collect(part.result.value)
+          if (part?.type === "tool" && Array.isArray(part.state?.content)) collect(part.state.content)
+        }
+      }
+      for (const message of messages) {
+        const parts = Array.isArray(message?.parts) ? message.parts : message?.content
+        if (Array.isArray(parts)) collect(parts)
+      }
       const state = { files: 0, total: 0 }
       const preprocessState = { count: 0 }
-       const receivedParts = messages.flatMap((message: any) => Array.isArray(message?.parts) ? message.parts : Array.isArray(message?.content) ? message.content : [])
-       try {
-         const projectRoots = await sessionRoots(typeof event?.sessionID === "string" ? event.sessionID : "")
-         for (const message of messages) {
-           const parts = Array.isArray(message?.parts) ? message.parts : message?.content
-            if (Array.isArray(parts)) snapshots.set(message, parts.slice())
-         }
+      try {
+        const projectRoots = await sessionRoots(typeof event?.sessionID === "string" ? event.sessionID : "")
         const totalMatches = [...snapshots.values()].reduce((count, parts) => count + parts.filter(part => isMatching(part, patterns)).length, 0)
         if (totalMatches > configured.maxFilesPerTransform) {
           const message = `transform has more than maxFilesPerTransform (${configured.maxFilesPerTransform}) files`
-           for (const [target, parts] of snapshots) {
-             const targetParts = Array.isArray(target?.parts) ? target.parts : target?.content
-             if (Array.isArray(targetParts)) replaceParts(targetParts, parts.map(part => isMatching(part, patterns) ? errorPart(part, message) : part))
-           }
+          for (const parts of snapshots.keys()) replaceMatches(parts, message)
           return
         }
-         for (const message of messages) {
-           const parts = Array.isArray(message?.parts) ? message.parts : message?.content
-           if (!Array.isArray(parts)) continue
-            const original = snapshots.get(message) ?? parts.slice()
-           snapshots.set(message, original)
-           guardAttachmentReads(parts, projectRoots, dir)
-           await transformParts(parts, state)
-           await preprocessParts(parts, preprocessState)
-         }
+        for (const parts of snapshots.keys()) {
+          guardAttachmentReads(parts, projectRoots, dir)
+          await transformParts(parts, state)
+          await preprocessParts(parts, preprocessState)
+        }
       } catch (error) {
-        diagnosticLog(dir, "session.context.error", receivedParts, error)
+        diagnosticLog(dir, "session.context.error", [...snapshots.values()].flat(), error)
         console.error("[media-guard] transform failed:", safeError(error))
-         for (const [message, parts] of snapshots) {
-           const target = Array.isArray(message?.parts) ? message.parts : message?.content
-           if (Array.isArray(target)) replaceParts(target, parts)
-         }
+        for (const [target, parts] of snapshots) {
+          replaceParts(target, parts.map(part => isMatching(part, patterns) ? errorPart(part, safeError(error)) : part))
+        }
       }
     }
     const transformPrompt = async (event: any): Promise<void> => {
@@ -762,6 +766,9 @@ const MediaGuardPlugin = {
     const registrations = await Promise.all([
       context.session.hook("prompt", transformPrompt),
       context.session.hook("context", transformMessages),
+      context.session.hook("compaction", transformMessages),
+      context.session.hook("generate", transformMessages),
+      context.session.hook("title", transformMessages),
     ])
     return async () => { await Promise.all(registrations.map((registration: any) => registration?.dispose?.())) }
   },

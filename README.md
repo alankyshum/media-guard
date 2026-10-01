@@ -21,13 +21,15 @@ Add the plugin path to `config/opencode/opencode.jsonc` (the dotfiles configurat
 
 ```jsonc
 {
-  "plugin": [
-    "../../external/media-guard/media-guard.ts"
+  "plugins": [
+    "./plugins/media-guard"
   ]
 }
 ```
 
-For another checkout, replace the relative path with the absolute path to `media-guard.ts`. The plugin resolves its vendored scripts relative to that file, not relative to the current working directory.
+The dotfiles directory entrypoint re-exports `external/media-guard/media-guard.ts`. For another checkout, configure that file's absolute path. The plugin resolves its vendored scripts relative to that file, not relative to the current working directory.
+
+The V2 prompt hook handles incoming attachments. The context, compaction, generate, and title hooks replace supported media with local manifests before provider requests, including nested `tool-result.result.value` content, stored `tool.state.content`, and canonical `media.source` assets. V2 file parts use `uri` and `name`; legacy `url` and `filename` remain supported. Tool IDs, inputs, and opaque JSON results are not rewritten. Malformed payloads become explicit error manifests without being forwarded or silently reconstructed; existing corrupted session records are not rewritten on disk.
 
 ## Install for Claude Code
 
@@ -54,7 +56,7 @@ The existing dotfiles runtime supplies these values under `plugins.media_guard` 
 | Setting | Default | Meaning |
 |---|---:|---|
 | `maxMaterializedBytes` | `104857600` | Maximum bytes for one staged attachment. |
-| `maxMaterializedFilesPerTransform` | `64` | Maximum top-level attachments in one transform during materialization/guard staging. |
+| `maxMaterializedFilesPerTransform` | `64` | Maximum attachments across top-level and nested tool content in one transform during materialization/guard staging. |
 | `maxTotalMaterializedBytes` | `524288000` | Maximum aggregate staged bytes in one transform. |
 | `maxExtractedChars` | `200000` | Maximum inline extracted characters. |
 | `timeoutMs` | `300000` | Extractor timeout in milliseconds. |
