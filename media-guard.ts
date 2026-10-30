@@ -183,6 +183,16 @@ function partMime(part: any): string {
   const mime = part?.mediaType ?? part?.mime ?? part?.media?.mediaType ?? part?.media?.source?.mediaType
   return typeof mime === "string" ? canonicalMime(mime) : "application/octet-stream"
 }
+function isSupportedImage(path: string, mime: string): boolean {
+  const fd = openSync(path, "r")
+  const head = Buffer.alloc(12)
+  let length: number
+  try { length = readSync(fd, head, 0, head.length, 0) } finally { closeSync(fd) }
+  return (mime === "image/png" && length >= 8 && head.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) ||
+    (mime === "image/jpeg" && length >= 3 && head[0] === 255 && head[1] === 216 && head[2] === 255) ||
+    (mime === "image/gif" && length >= 6 && ["GIF87a", "GIF89a"].includes(head.subarray(0, 6).toString("ascii"))) ||
+    (mime === "image/webp" && length >= 12 && head.subarray(0, 4).toString("ascii") === "RIFF" && head.subarray(8, 12).toString("ascii") === "WEBP")
+}
 function isMatching(part: any, patterns: string[]): boolean {
   const mime = partMime(part)
   return (part?.type === "media" || part?.type === "file") && typeof mime === "string" && matchesMime(mime, patterns)
@@ -655,6 +665,18 @@ const MediaGuardPlugin = {
         return []
       }
     }
+    const authorizedVisionModel = async (agent: unknown, model: any): Promise<boolean> => {
+      if (agent !== "vision-reader") return false
+      try {
+        const info: any = await context.agent.get({ agentID: "vision-reader" })
+        const configured = info?.data?.model ?? info?.model
+        return configured?.providerID === "github-copilot" && model?.providerID === configured.providerID &&
+          typeof configured.id === "string" && model?.id === configured.id
+      } catch (error) {
+        diagnosticLog(dir, "vision-reader.model.error", [], error)
+        return false
+      }
+    }
     const preprocessParts = async (parts: any[], state = { count: 0 }): Promise<void> => {
        const snapshot = parts.slice()
       try {
@@ -675,7 +697,7 @@ const MediaGuardPlugin = {
       const snapshot = parts.slice()
       replaceParts(parts, snapshot.map(part => isMatching(part, patterns) ? errorPart(part, message) : part))
     }
-    const transformParts = async (parts: any[], state = { files: 0, total: 0 }): Promise<void> => {
+    const transformParts = async (parts: any[], state = { files: 0, total: 0 }, allowVisionImages = false): Promise<void> => {
       const snapshot = parts.slice()
       const matches = snapshot.filter(part => isMatching(part, patterns))
       if (state.files + matches.length > configured.maxFilesPerTransform) {
@@ -691,6 +713,13 @@ const MediaGuardPlugin = {
            const mime = partMime(part)
           const staged = await materialize(part, mime, dir, configured.maxMaterializedBytes, configured.maxTotalMaterializedBytes - state.total)
           state.total += staged.size ?? 0
+          // Only the dedicated vision agent receives locally materialized
+          // image parts. Limits and validation still apply; remote URLs and
+          // all non-image media remain guarded.
+          if (allowVisionImages && staged.path && !staged.error && isSupportedImage(staged.path, mime)) {
+            transformed.push(part)
+            continue
+          }
           const record = { schema_version: 1, filename: safeName(part.filename ?? part.name), path: staged.path, mime, media_kind: mediaKind(mime), size: staged.size, sha256: staged.sha256, source: staged.source, ...(staged.error ? { error: staged.error } : {}) }
             transformed.push({ ...identity(part), type: "text", text: `[media-guard attachment manifest]\n${JSON.stringify(record)}`, synthetic: true })
         } catch (error) { diagnosticLog(dir, "transformParts.error", [part], error); transformed.push(errorPart(part, error)) }
@@ -715,6 +744,7 @@ const MediaGuardPlugin = {
       const state = { files: 0, total: 0 }
       const preprocessState = { count: 0 }
       try {
+        const allowVisionImages = await authorizedVisionModel(event?.agent, event?.model)
         const projectRoots = await sessionRoots(typeof event?.sessionID === "string" ? event.sessionID : "")
         const totalMatches = [...snapshots.values()].reduce((count, parts) => count + parts.filter(part => isMatching(part, patterns)).length, 0)
         if (totalMatches > configured.maxFilesPerTransform) {
@@ -724,7 +754,7 @@ const MediaGuardPlugin = {
         }
         for (const parts of snapshots.keys()) {
           guardAttachmentReads(parts, projectRoots, dir)
-          await transformParts(parts, state)
+          await transformParts(parts, state, allowVisionImages)
           await preprocessParts(parts, preprocessState)
         }
       } catch (error) {
@@ -747,7 +777,14 @@ const MediaGuardPlugin = {
       })
       const snapshot = files.slice()
       try {
-        await transformParts(parts)
+        let allowVisionImages = false
+        if (typeof event?.sessionID === "string") {
+          try {
+            const session = await context.session.get({ sessionID: event.sessionID })
+            allowVisionImages = await authorizedVisionModel((session as any)?.agent, (session as any)?.model)
+          } catch (error) { diagnosticLog(dir, "session.prompt.get.error", [], error) }
+        }
+        await transformParts(parts, undefined, allowVisionImages)
         const converted = parts.map((part: any, index: number) => ({ part, file: snapshot[index] }))
         const manifests = converted.filter(({ part }) => part?.type === "text" && typeof part.text === "string")
         const retained = converted.filter(({ part }) => part?.type === "file")

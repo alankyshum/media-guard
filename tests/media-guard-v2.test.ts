@@ -10,18 +10,19 @@ const root = mkdtempSync(join(tmpdir(), "media-guard-v2-"))
 const hooks = new Map<string, (event: any) => unknown>()
 const plugin = MediaGuardPlugin as any
 
-async function setup(options: Record<string, unknown> = {}, sessionDirectories: Record<string, string> = {}) {
+async function setup(options: Record<string, unknown> = {}, sessionDirectories: Record<string, string> = {}, sessionAgents: Record<string, string> = {}) {
   const registrations: string[] = []
   const cleanup = await plugin.setup({
     options: { ...options, materializationDir: join(root, "materialized"), cacheDir: join(root, "cache") },
     location: { directory: root },
+    agent: { get: async () => ({ model: { providerID: "github-copilot", id: "configured-vision" } }) },
     session: {
       hook: async (name: string, callback: (event: any) => unknown) => {
         hooks.set(name, callback)
         registrations.push(name)
         return { dispose: async () => { hooks.delete(name) } }
       },
-      get: async ({ sessionID }: { sessionID: string }) => ({ location: { directory: sessionDirectories[sessionID] ?? root } }),
+      get: async ({ sessionID }: { sessionID: string }) => ({ location: { directory: sessionDirectories[sessionID] ?? root }, agent: sessionAgents[sessionID], model: { providerID: "github-copilot", id: "configured-vision" } }),
     },
   })
   assert.deepEqual(registrations, ["prompt", "context", "compaction", "generate", "title"])
@@ -102,6 +103,42 @@ function manifest(part: unknown): { filename: string; path: string | null; size:
   assert.ok(part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string")
   return JSON.parse(part.text.split("\n")[1])
 }
+
+test("only vision-reader receives validated local images; other agents and media remain guarded", async () => {
+  const cleanup = await setup({ enabledKinds: [], maxMaterializedBytes: 32 }, {}, { vision: "vision-reader", lead: "lead" })
+  try {
+    const raw = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2])
+    for (const agent of ["vision-reader", "lead", undefined]) {
+      const image = filePart(raw, "image/png", "frame.png")
+      const nested = [image, filePart(Buffer.from("PDF"), "application/pdf", "doc.pdf")]
+      await hooks.get("context")!({ sessionID: "vision", agent, model: { providerID: "github-copilot", id: "configured-vision" }, messages: [{ content: [toolResult(nested)] }] })
+      if (agent === "vision-reader") assert.equal(nested[0], image)
+      else assert.equal(manifest(nested[0]).size, raw.length)
+      assert.equal(manifest(nested[1]).filename, "doc.pdf")
+    }
+    const remote = { type: "file", name: "remote.png", mime: "image/png", uri: "https://example.invalid/x.png" }
+    const tooBig = filePart(Buffer.alloc(33), "image/png", "large.png")
+    const parts: unknown[] = [remote, tooBig]
+    await hooks.get("generate")!({ sessionID: "vision", agent: "vision-reader", model: { providerID: "github-copilot", id: "configured-vision" }, messages: [{ content: parts }] })
+    assert.equal(manifest(parts[0]).path, null)
+    assert.match(manifest(parts[1]).error ?? "", /maxMaterializedBytes/)
+    const disguised: unknown[] = [filePart(Buffer.from("%PDF-1.4"), "image/png", "disguised.png")]
+    await hooks.get("context")!({ sessionID: "vision", agent: "vision-reader", model: { providerID: "github-copilot", id: "configured-vision" }, messages: [{ content: disguised }] })
+    assert.equal(manifest(disguised[0]).size, 8)
+    for (const model of [{ providerID: "other", id: "configured-vision" }, { providerID: "github-copilot", id: "other-model" }, undefined]) {
+      const overridden: unknown[] = [filePart(raw, "image/png", "frame.png")]
+      await hooks.get("context")!({ sessionID: "vision", agent: "vision-reader", model, messages: [{ content: overridden }] })
+      assert.equal(manifest(overridden[0]).size, raw.length)
+    }
+
+    for (const id of ["vision", "lead", "unknown"]) {
+      const uri = `data:image/png;base64,${raw.toString("base64")}`
+      const event = { sessionID: id, prompt: { text: "inspect", files: [{ uri, name: "x.png" }] } }
+      await hooks.get("prompt")!(event)
+      assert.equal(event.prompt.files.length, id === "vision" ? 1 : 0)
+    }
+  } finally { await cleanup?.() }
+})
 
 test("V2 request hooks materialize nested tool files without changing call IDs or opaque JSON", async () => {
   const raw = Buffer.from("%PDF-1.4\nnested bytes\n%%EOF")
