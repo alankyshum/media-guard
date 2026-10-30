@@ -670,8 +670,9 @@ const MediaGuardPlugin = {
       try {
         const info: any = await context.agent.get({ agentID: "vision-reader" })
         const configured = info?.data?.model ?? info?.model
-        return configured?.providerID === "github-copilot" && model?.providerID === configured.providerID &&
-          typeof configured.id === "string" && model?.id === configured.id
+        return typeof configured?.providerID === "string" && configured.providerID.length > 0 &&
+          typeof configured.id === "string" && configured.id.length > 0 &&
+          model?.providerID === configured.providerID && model?.id === configured.id
       } catch (error) {
         diagnosticLog(dir, "vision-reader.model.error", [], error)
         return false

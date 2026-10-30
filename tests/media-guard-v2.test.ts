@@ -10,19 +10,19 @@ const root = mkdtempSync(join(tmpdir(), "media-guard-v2-"))
 const hooks = new Map<string, (event: any) => unknown>()
 const plugin = MediaGuardPlugin as any
 
-async function setup(options: Record<string, unknown> = {}, sessionDirectories: Record<string, string> = {}, sessionAgents: Record<string, string> = {}) {
+async function setup(options: Record<string, unknown> = {}, sessionDirectories: Record<string, string> = {}, sessionAgents: Record<string, string> = {}, configuredModel: { providerID?: string; id?: string } = { providerID: "github-copilot", id: "configured-vision" }) {
   const registrations: string[] = []
   const cleanup = await plugin.setup({
     options: { ...options, materializationDir: join(root, "materialized"), cacheDir: join(root, "cache") },
     location: { directory: root },
-    agent: { get: async () => ({ model: { providerID: "github-copilot", id: "configured-vision" } }) },
+    agent: { get: async () => ({ model: configuredModel }) },
     session: {
       hook: async (name: string, callback: (event: any) => unknown) => {
         hooks.set(name, callback)
         registrations.push(name)
         return { dispose: async () => { hooks.delete(name) } }
       },
-      get: async ({ sessionID }: { sessionID: string }) => ({ location: { directory: sessionDirectories[sessionID] ?? root }, agent: sessionAgents[sessionID], model: { providerID: "github-copilot", id: "configured-vision" } }),
+      get: async ({ sessionID }: { sessionID: string }) => ({ location: { directory: sessionDirectories[sessionID] ?? root }, agent: sessionAgents[sessionID], model: configuredModel }),
     },
   })
   assert.deepEqual(registrations, ["prompt", "context", "compaction", "generate", "title"])
@@ -138,6 +138,32 @@ test("only vision-reader receives validated local images; other agents and media
       assert.equal(event.prompt.files.length, id === "vision" ? 1 : 0)
     }
   } finally { await cleanup?.() }
+})
+
+test("vision-reader uses the configured provider and rejects incomplete model identities", async () => {
+  const raw = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2])
+  for (const configuredModel of [
+    { providerID: "other-provider", id: "vision-model" },
+    { id: "vision-model" },
+    { providerID: "other-provider" },
+    { providerID: "", id: "vision-model" },
+    { providerID: "other-provider", id: "" },
+  ]) {
+    const cleanup = await setup({ enabledKinds: [] }, {}, { vision: "vision-reader" }, configuredModel)
+    try {
+      const image = filePart(raw, "image/png", "frame.png")
+      const parts: unknown[] = [image]
+      await hooks.get("context")!({ sessionID: "vision", agent: "vision-reader", model: configuredModel, messages: [{ content: parts }] })
+      const valid = configuredModel.providerID === "other-provider" && configuredModel.id === "vision-model"
+      if (valid) assert.equal(parts[0], image)
+      else assert.equal(manifest(parts[0]).size, raw.length)
+
+      const uri = `data:image/png;base64,${raw.toString("base64")}`
+      const event = { sessionID: "vision", prompt: { text: "inspect", files: [{ uri, name: "x.png" }] } }
+      await hooks.get("prompt")!(event)
+      assert.equal(event.prompt.files.length, valid ? 1 : 0)
+    } finally { await cleanup?.() }
+  }
 })
 
 test("V2 request hooks materialize nested tool files without changing call IDs or opaque JSON", async () => {
