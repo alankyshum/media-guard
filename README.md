@@ -51,7 +51,7 @@ The Claude plugin manifest is `.claude-plugin/plugin.json`; its skill is auto-di
 
 ## Configuration reference
 
-The existing dotfiles runtime supplies these values under `plugins.media_guard` in `config/agent-runtime/agent-config.yml`. Plugin options take precedence over workspace configuration. A missing workspace block is a hard initialization error rather than a silent fallback; individual omitted settings still use the defaults below.
+The existing dotfiles runtime supplies these values under `plugins.media_guard` in `config/agent-runtime/agent-config.yml`. The path is independent of the plugin checkout: `MEDIA_GUARD_RUNTIME_CONFIG` takes precedence, then `DOTFILES_DIR`, then `${DOCUMENTS_PATH:-/Volumes/Documents}/dotfiles`. These paths must be absolute. Plugin options take precedence over workspace configuration. A missing workspace block is a hard initialization error rather than a silent fallback; individual omitted settings still use the defaults below.
 
 | Setting | Default | Meaning |
 |---|---:|---|
@@ -76,6 +76,7 @@ Environment overrides:
 
 | Variable | Purpose |
 |---|---|
+| `MEDIA_GUARD_RUNTIME_CONFIG` | Absolute path to the agent runtime YAML configuration. |
 | `MEDIA_GUARD_PYTHON` | Explicit Python executable; otherwise the repo-local `.venv/bin/python`, then `python3` from `PATH`. |
 | `MEDIA_GUARD_ANYDOC` | Explicit anydoc executable; otherwise `anydoc` from `PATH`, then `npx -y @firecrawl/anydoc`. |
 | `MEDIA_GUARD_FFMPEG` | Explicit ffmpeg executable for video keyframes. |

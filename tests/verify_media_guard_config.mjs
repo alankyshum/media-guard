@@ -4,13 +4,14 @@ import { join } from "node:path"
 import { spawnSync } from "node:child_process"
 
 const testDir = import.meta.dir
-const configPath = process.env.MEDIA_GUARD_CONFIG || join(testDir, "..", "..", "..", "config", "opencode", "opencode.jsonc")
+const dotfiles = process.env.DOTFILES_DIR || join(process.env.DOCUMENTS_PATH || "/Volumes/Documents", "dotfiles")
+const configPath = process.env.MEDIA_GUARD_CONFIG || join(dotfiles, "config", "opencode", "opencode.jsonc")
 const config = readFileSync(configPath, "utf8")
-const wrapper = readFileSync(join(testDir, "..", "..", "..", "config", "opencode", "plugins", "media-guard.ts"), "utf8")
+const wrapper = readFileSync(join(dotfiles, "config", "opencode", "plugins", "media-guard", "index.ts"), "utf8")
 const implementation = readFileSync(join(testDir, "..", "media-guard.ts"), "utf8")
 
-if (!config.includes('"./plugins/media-guard.ts"')) throw new Error("wrapper plugin is not registered")
-if (!wrapper.includes('from "../../../external/media-guard/media-guard.ts"')) throw new Error("wrapper does not target the submodule")
+if (!config.includes('"./plugins/media-guard"')) throw new Error("wrapper plugin is not registered")
+if (!wrapper.includes('from "../../../../external/media-guard/media-guard.ts"')) throw new Error("wrapper does not target media-guard")
 for (const required of ["data:", "source", "filename", "size", "media_kind", "[media-guard attachment manifest]", "type: \"text\""]) {
   if (!implementation.includes(required)) throw new Error(`manifest behavior missing: ${required}`)
 }

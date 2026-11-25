@@ -1,7 +1,7 @@
 // Materialize attachments. Never inspect media content beyond staging/hash bytes.
 import { createHash } from "node:crypto"
 import { accessSync, appendFileSync, chmodSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, closeSync, unlinkSync, writeSync, writeFileSync, constants as fsConstants, rmSync, readdirSync } from "node:fs"
-import { basename, dirname, extname, join, resolve, relative } from "node:path"
+import { basename, dirname, extname, isAbsolute, join, resolve, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 import type { Plugin as PluginDefinition } from "@opencode/plugin/promise/plugin"
@@ -15,8 +15,12 @@ const FALLBACKS: Limits = { maxMaterializedBytes: 100 * 1024 * 1024, maxFilesPer
 const PLUGIN_PATH = realpathSync(fileURLToPath(import.meta.url))
 const PLUGIN_DIR = dirname(PLUGIN_PATH)
 const SCRIPTS_DIR = join(PLUGIN_DIR, "scripts")
-const REPO_ROOT = resolve(PLUGIN_DIR, "../..")
-const CONFIG_PATH = join(REPO_ROOT, "config/agent-runtime/agent-config.yml")
+export function resolveMediaGuardConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  const path = env.MEDIA_GUARD_RUNTIME_CONFIG || join(env.DOTFILES_DIR || join(env.DOCUMENTS_PATH || "/Volumes/Documents", "dotfiles"), "config/agent-runtime/agent-config.yml")
+  if (!isAbsolute(path)) throw new Error("media-guard: runtime config path must be absolute")
+  return path
+}
+const CONFIG_PATH = resolveMediaGuardConfigPath()
 const DEFAULT_DIR = join(tmpdir(), "opencode-media-guard")
 const ATTACHMENT_READ_MARKER = "Called the Read tool with the following input:"
 

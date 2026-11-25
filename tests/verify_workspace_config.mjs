@@ -3,6 +3,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "nod
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { pathToFileURL } from "node:url"
+import { strict as assert } from "node:assert"
 
 const source = join(import.meta.dir, "..", "media-guard.ts")
 
@@ -12,10 +13,26 @@ async function fixture(config) {
   mkdirSync(pluginDir, { recursive: true })
   mkdirSync(join(root, "config", "agent-runtime"), { recursive: true })
   copyFileSync(source, join(pluginDir, "media-guard.ts"))
-  writeFileSync(join(root, "config", "agent-runtime", "agent-config.yml"), config)
+  const configPath = join(root, "config", "agent-runtime", "agent-config.yml")
+  writeFileSync(configPath, config)
   const url = `${pathToFileURL(join(pluginDir, "media-guard.ts"))}?fixture=${Date.now()}-${Math.random()}`
-  const module = await import(url)
+  const previous = process.env.MEDIA_GUARD_RUNTIME_CONFIG
+  process.env.MEDIA_GUARD_RUNTIME_CONFIG = configPath
+  let module
+  try { module = await import(url) } finally {
+    if (previous === undefined) delete process.env.MEDIA_GUARD_RUNTIME_CONFIG
+    else process.env.MEDIA_GUARD_RUNTIME_CONFIG = previous
+  }
   return { root, plugin: module.default }
+}
+
+{
+  const { resolveMediaGuardConfigPath } = await import(source)
+  assert.equal(resolveMediaGuardConfigPath({}), "/Volumes/Documents/dotfiles/config/agent-runtime/agent-config.yml")
+  assert.equal(resolveMediaGuardConfigPath({ DOCUMENTS_PATH: "/other/Documents" }), "/other/Documents/dotfiles/config/agent-runtime/agent-config.yml")
+  assert.equal(resolveMediaGuardConfigPath({ DOTFILES_DIR: "/custom/dotfiles", DOCUMENTS_PATH: "/other/Documents" }), "/custom/dotfiles/config/agent-runtime/agent-config.yml")
+  assert.equal(resolveMediaGuardConfigPath({ MEDIA_GUARD_RUNTIME_CONFIG: "/custom/config.yml", DOTFILES_DIR: "/custom/dotfiles" }), "/custom/config.yml")
+  assert.throws(() => resolveMediaGuardConfigPath({ MEDIA_GUARD_RUNTIME_CONFIG: "relative.yml" }), /must be absolute/)
 }
 
 async function setup(plugin, root, options = {}) {
